@@ -1,0 +1,144 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500&display=swap');
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --background: 228 30% 6%;
+    --foreground: 210 40% 98%;
+
+    --card: 228 25% 10%;
+    --card-foreground: 210 40% 98%;
+
+    --popover: 228 25% 10%;
+    --popover-foreground: 210 40% 98%;
+
+    --primary: 217 91% 60%;
+    --primary-foreground: 210 40% 98%;
+
+    --secondary: 228 22% 14%;
+    --secondary-foreground: 210 40% 98%;
+
+    --muted: 228 18% 18%;
+    --muted-foreground: 215 20% 55%;
+
+    --accent: 4 84% 54%;
+    --accent-foreground: 210 40% 98%;
+
+    --destructive: 4 84% 54%;
+    --destructive-foreground: 210 40% 98%;
+
+    --border: 228 15% 18%;
+    --input: 228 22% 14%;
+    --ring: 217 91% 60%;
+
+    --radius: 0.75rem;
+
+    /* Custom gradient tokens */
+    --gradient-bg: linear-gradient(145deg, hsl(228 30% 6%) 0%, hsl(232 35% 9%) 50%, hsl(228 30% 6%) 100%);
+    --gradient-card: linear-gradient(135deg, hsl(228 25% 12%) 0%, hsl(228 25% 9%) 100%);
+    --gradient-primary: linear-gradient(135deg, hsl(217 91% 60%) 0%, hsl(230 90% 65%) 100%);
+    --gradient-accent: linear-gradient(135deg, hsl(4 84% 54%) 0%, hsl(15 90% 55%) 100%);
+    --gradient-glow: radial-gradient(ellipse at 50% 0%, hsl(217 91% 60% / 0.15) 0%, transparent 60%);
+    --gradient-accent-glow: radial-gradient(ellipse at 50% 0%, hsl(4 84% 54% / 0.12) 0%, transparent 60%);
+
+    /* Shadow tokens */
+    --shadow-sm: 0 2px 8px hsl(228 30% 3% / 0.4);
+    --shadow-md: 0 4px 16px hsl(228 30% 3% / 0.5);
+    --shadow-lg: 0 8px 32px hsl(228 30% 3% / 0.6);
+    --shadow-glow-primary: 0 0 20px hsl(217 91% 60% / 0.25);
+    --shadow-glow-accent: 0 0 20px hsl(4 84% 54% / 0.25);
+
+    --sidebar-background: 228 25% 8%;
+    --sidebar-foreground: 210 40% 98%;
+    --sidebar-primary: 217 91% 60%;
+    --sidebar-primary-foreground: 210 40% 98%;
+    --sidebar-accent: 228 22% 14%;
+    --sidebar-accent-foreground: 210 40% 98%;
+    --sidebar-border: 228 15% 15%;
+    --sidebar-ring: 217 91% 60%;
+  }
+}
+
+@layer base {
+  * {
+    @apply border-border;
+  }
+
+  body {
+    @apply bg-background text-foreground font-sans antialiased;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    background: var(--gradient-bg);
+    min-height: 100vh;
+  }
+
+  html, body, #root {
+    width: 100%;
+    height: 100%;
+    margin: 0;
+    padding: 0;
+  }
+
+  /* Custom scrollbar */
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: hsl(var(--background));
+  }
+  ::-webkit-scrollbar-thumb {
+    background: hsl(var(--muted));
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: hsl(var(--muted-foreground));
+  }
+}
+
+@layer utilities {
+  .gradient-bg {
+    background: var(--gradient-bg);
+  }
+  .gradient-card {
+    background: var(--gradient-card);
+  }
+  .gradient-primary {
+    background: var(--gradient-primary);
+  }
+  .gradient-accent {
+    background: var(--gradient-accent);
+  }
+  .glow-primary {
+    box-shadow: var(--shadow-glow-primary);
+  }
+  .glow-accent {
+    box-shadow: var(--shadow-glow-accent);
+  }
+  .glass {
+    background: hsl(var(--card) / 0.6);
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+  }
+  .border-gradient {
+    border: 1px solid hsl(var(--border));
+    background-clip: padding-box;
+  }
+  .text-gradient-primary {
+    background: var(--gradient-primary);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .text-gradient-accent {
+    background: var(--gradient-accent);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+  }
+  .shadow-card {
+    box-shadow: var(--shadow-md);
+  }
+}

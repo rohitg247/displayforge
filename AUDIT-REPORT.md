@@ -1,0 +1,118 @@
+# TECHNICAL AUDIT REPORT: Actis Digital Signage Platform
+
+**Date**: Current analysis  
+**Project**: `project/` (React + FastAPI digital signage CMS for Actis)  
+**Scope**: Full structure/stack/architecture review (no fixes)
+
+## 1. PROJECT STRUCTURE
+
+### Full Folder/File Tree (recursive listing)
+```
+project/
+├── .gitignore
+├── bun.lockb
+├── check_db.py, check_path.py, check_schema.py, migrate.py (DB utils)
+├── components.json, eslint.config.js
+├── index.html (Vite entry)
+├── package(-lock).json (FE deps)
+├── postcss.config.js, tailwind.config.js, vite.config.js, vitest.config.js
+├── README.md (Lovable guide)
+├── public/ (favicon, svg, robots.txt)
+├── server/ (FastAPI backend)
+│   ├── __init__.py, auth.py, config.py (dotenv, settings), database.py
+│   ├── main.py (app entry + seed)
+│   ├── models.py, schema.sql (SQLite DDL), requirements.txt
+│   ├── db_queries.md, routers/ (6 APIRouters: auth/branches/etc.)
+│   └── uploads/ (static media)
+└── src/ (React app)
+    ├── App.jsx/main.jsx/index.css (root)
+    ├── assets/ (Actis logo/images)
+    ├── components/admin/ (ActisButton/Card/etc.), layout/ (AdminLayout/Nav), ui/ (shadcn)
+    ├── context/AppContext.jsx, hooks/, lib/utils.js (cn())
+    ├── pages/ (~12 pages + duplicates like ' copy.jsx')
+    ├── routes/ProtectedRoute.jsx
+    ├── services/api.js (fetch client)
+    └── test/ (vitest setup)
+```
+
+**Entry Points**:
+- FE: `index.html` → `src/main.jsx` → `App.jsx` (Router/QueryClient)
+- BE: `server/main.py` (FastAPI, lifespan: init_db/seed)
+
+**Configs**: package.json, vite/tailwind/postcss, requirements.txt, schema.sql, server/config.py
+**Unusual**: Duplicate pages (e.g., DisplayViewerPage copy.jsx), bun.lockb
+
+**Size**: Medium (150 files)
+
+## 2. TECH STACK
+
+- **FE**: React 18.3, Vite 5.4 (port 8080), Tailwind 3.4 + shadcn/Radix, React Router 6
+- **BE**: FastAPI 0.115, Uvicorn 0.30, SQLite (signage.db)
+- **Data/State**: TanStack Query 5.83, React Context, Zod, React Hook Form
+- **Auth**: JWT (HS256, 8h expiry), Argon2 hash
+- **UI**: Framer Motion, Lucide, Sonner toast, Recharts
+- **Test**: Vitest + RTL/Jest-DOM
+- **Other**: clsx, tailwind-merge/animate
+
+**No**: ORM (raw SQL), GraphQL/tRPC, Docker, TS (plain JS)
+
+## 3. ARCHITECTURE & DATA FLOW
+
+**Flow**:
+1. FE Vite dev → localhost:8080
+2. API calls (api.js) → BE localhost:8000 (VITE_API_URL)
+3. BE: Routers → raw SQLite queries (no ORM)
+
+**Routing**:
+- FE: React Router (/admin/* protected, /branch/:id viewer)
+- BE: /api/{auth,branches,displays,case-studies,uploads,ambient}
+
+**Data**: REST CRUD, TanStack cache, FormData uploads (/uploads static)
+
+**Env**: server/.env (SECRET_KEY etc.), auto-seed default admin@actis.com/admin123
+
+## 4. KEY FEATURES
+
+**Purpose**: Actis corporate digital signage CMS (displays case studies/media).
+
+- Admin: CRUD Branches → Displays/Ambient → Case Studies (thumbnails/bullets)
+- Viewers: /branch/:id (case studies), /ambient/:id (playlists A/B videos/images + announcements)
+- Uploads: Images/videos (size limits 5-50MB)
+- No roles/multi-tenant (single admin)
+
+## 5. CODE QUALITY
+
+- Consistent shadcn/Tailwind patterns
+- **Dead**: Duplicate ' copy.jsx' files
+- Hardcodes: SECRET_KEY='change-me...', admin pass 'admin123' (main.py seed)
+- No TODOs visible
+- Raw SQL (models.py), JS no TS
+
+## 6. DEPENDENCIES
+
+**FE Major** (package.json):
+```
+react/dom 18.3 • @tanstack/react-query 5.83 • react-router-dom 6.30
+shadcn: Radix primitives 1.x, clsx 2.1, tailwind-merge 2.6
+forms: react-hook-form 7.61, zod 3.25
+UI: framer-motion 12.34, lucide-react 0.462, recharts 2.15
+```
+**BE** (requirements.txt):
+```
+fastapi 0.115 • uvicorn 0.30 • pydantic 2.x • PyJWT 2.9 • argon2-cffi 23.1
+```
+
+No outdated/security issues.
+
+## 7. RED FLAGS
+
+- **Security**: Exposed defaults/creds, no rate-limit/IP whitelist
+- **Perf**: SQLite prod? Potential N+1 queries, heavy FE bundle
+- **Broken/Incomplete**: Duplicates, commented api.js code, empty tests
+- **Missing**: Error boundaries, types, prod hardening, migrations beyond migrate.py
+- **Other**: JS-only (risky), no CI/CD/Docker
+
+**Demo**: `cd project && npm run dev` (FE) + `cd server && venv activate && uvicorn main:app --reload --port 8000`
+
+Audit complete – codebase unchanged.
+
