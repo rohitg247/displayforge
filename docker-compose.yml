@@ -5,10 +5,6 @@ services:
       dockerfile: Dockerfile.backend
     ports:
       - "8888:8888"
-    volumes:
-      # Persist SQLite Database and Uploads
-      - ./server/signage.db:/app/server/signage.db
-      - ./server/uploads:/app/server/uploads
     restart: unless-stopped
 
   frontend:
