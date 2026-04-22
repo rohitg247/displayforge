@@ -5,6 +5,9 @@ services:
       dockerfile: Dockerfile.backend
     ports:
       - "8888:8888"
+    volumes:
+      # Map the directory instead of the individual file to let Python create the file
+      - ./server:/app/server
     restart: unless-stopped
 
   frontend:
