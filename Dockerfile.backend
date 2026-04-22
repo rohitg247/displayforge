@@ -1,0 +1,18 @@
+FROM python:3.11-slim
+
+WORKDIR /app
+
+# Install sqlite3 (helpful for debugging)
+RUN apt-get update && apt-get install -y sqlite3 && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements and install
+COPY server/requirements.txt server/
+RUN pip install --no-cache-dir -r server/requirements.txt
+
+# Copy the backend code
+COPY server/ server/
+
+EXPOSE 8888
+
+# Run Uvicorn on port 8888
+CMD ["uvicorn", "server.main:app", "--host", "0.0.0.0", "--port", "8888"]
