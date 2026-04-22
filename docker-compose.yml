@@ -6,8 +6,9 @@ services:
     ports:
       - "8888:8888"
     volumes:
-      # Map the directory instead of the individual file to let Python create the file
-      - ./server:/app/server
+      - backend_data:/data
+    env_file:
+      - .env
     restart: unless-stopped
 
   frontend:
@@ -15,10 +16,12 @@ services:
       context: .
       dockerfile: Dockerfile.frontend
       args:
-        # Since you are using host Nginx later, point this to the host's IP/Domain where the backend is accessible
-        VITE_API_URL: http://localhost:8888
+        VITE_API_URL: ${VITE_API_URL}
     ports:
-      - "3200:3200" 
+      - "3200:3200"
     depends_on:
       - backend
     restart: unless-stopped
+
+volumes:
+  backend_data:

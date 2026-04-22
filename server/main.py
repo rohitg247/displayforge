@@ -99,7 +99,6 @@ def seed_db():
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
-    Path(settings.UPLOAD_DIR).mkdir(exist_ok=True)
     seed_db()
     yield
 
@@ -114,7 +113,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve uploaded images
+# Create upload dir before StaticFiles checks for it (needed for named volumes on fresh start)
+Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
 app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
 app.include_router(auth_router.router, prefix="/api/auth", tags=["auth"])

@@ -11,7 +11,7 @@ class Settings:
     DATABASE_PATH: str = os.getenv(
         "DATABASE_PATH", str(Path(__file__).parent / "signage.db")
     )
-    UPLOAD_DIR: str = str(Path(__file__).parent / "uploads")
+    UPLOAD_DIR: str = os.getenv("UPLOAD_DIR", str(Path(__file__).parent / "uploads"))
     CORS_ORIGINS: list = os.getenv(
         "CORS_ORIGINS", "http://localhost:8080,http://localhost:5173"
     ).split(",")
