@@ -20,6 +20,10 @@ def db_dependency():
 
 
 def init_db():
+    # schema.sql uses CREATE TABLE IF NOT EXISTS — safe to run on an existing production
+    # database. It will never drop or overwrite data. To make schema changes, use
+    # migrate.py from the project root (local dev only). For production schema changes,
+    # run ALTER TABLE statements manually against the /data/signage.db volume.
     conn = get_db()
     schema_path = Path(__file__).parent / "schema.sql"
     conn.executescript(schema_path.read_text())

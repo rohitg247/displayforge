@@ -157,3 +157,21 @@ Audit complete – codebase unchanged.
 3. Uploaded and deleted media now appear/disappear instantly in the media grid
 4. View and Preview links now work in local development via Vite dev server proxy
 
+---
+
+## Phase 1: Production Database Persistence & Backup
+**Date:** 27 April 2026
+**Time:** 16:15
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `.dockerignore` | Created — excludes `server/signage.db`, `server/uploads/`, `node_modules/`, `dist/`, `.env`, `venv/`, `__pycache__/`, `*.pyc`, `.git/`, `.claude/` from Docker build context |
+| `server/main.py` | Added `import shutil`; added `backup_db()` function; updated `lifespan` to call `backup_db()` before `init_db()` |
+| `server/database.py` | Added comment to `init_db()` documenting schema safety and migrate.py usage policy |
+
+### Issues Resolved
+1. Database and uploads directory can no longer be baked into the Docker image — `.dockerignore` prevents `COPY server/ server/` from including them
+2. Container startup now rotates backups: `signage.db → .bak1 → .bak2` (max 2 backups kept on the `/data` volume)
+3. `init_db()` confirmed safe for production — `CREATE TABLE IF NOT EXISTS` only, no DROP TABLE; schema change policy documented in code
+

@@ -323,4 +323,131 @@ server: {
 
 ---
 
+---
+
+## Session 3 — 27 April 2026, 16:15
+**Topic:** Phase 1 — Production Database Persistence & Backup
+
+---
+
+### 1. `.dockerignore` — Created (new file)
+
+**Before:** File did not exist. Entire project directory was sent as Docker build context, including `server/signage.db`, `server/uploads/`, `node_modules/`, `.env`, `venv/`, `.git/`, etc.
+
+**After:**
+```
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+
+# Database and uploaded media — must live on the Docker volume, never baked into the image
+server/signage.db
+server/signage.db.bak1
+server/signage.db.bak2
+server/uploads/
+
+# Frontend build artifacts and dependencies
+node_modules/
+dist/
+
+# Environment and secrets
+.env
+
+# Git and editor
+.git/
+.claude/
+```
+
+---
+
+### 2. `server/main.py` — Add shutil import
+
+**Before:**
+```python
+from contextlib import asynccontextmanager
+from pathlib import Path
+from fastapi import FastAPI
+```
+**After:**
+```python
+from contextlib import asynccontextmanager
+from pathlib import Path
+import shutil
+from fastapi import FastAPI
+```
+
+---
+
+### 3. `server/main.py` — Add backup_db() function
+
+**Before:** *(function did not exist)*
+
+**After:**
+```python
+def backup_db():
+    """Rotate backups before startup: signage.db → .bak1 → .bak2. Keeps last 2 backups."""
+    db_path = Path(settings.DATABASE_PATH)
+    if not db_path.exists():
+        return
+    bak1 = Path(str(db_path) + '.bak1')
+    bak2 = Path(str(db_path) + '.bak2')
+    if bak1.exists():
+        bak1.replace(bak2)
+    shutil.copy2(db_path, bak1)
+```
+
+---
+
+### 4. `server/main.py` — Update lifespan to call backup_db() first
+
+**Before:**
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    seed_db()
+    yield
+```
+**After:**
+```python
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    backup_db()
+    init_db()
+    seed_db()
+    yield
+```
+
+---
+
+### 5. `server/database.py` — Document init_db() safety and schema change policy
+
+**Before:**
+```python
+def init_db():
+    conn = get_db()
+    schema_path = Path(__file__).parent / "schema.sql"
+    conn.executescript(schema_path.read_text())
+    conn.commit()
+    conn.close()
+```
+**After:**
+```python
+def init_db():
+    # schema.sql uses CREATE TABLE IF NOT EXISTS — safe to run on an existing production
+    # database. It will never drop or overwrite data. To make schema changes, use
+    # migrate.py from the project root (local dev only). For production schema changes,
+    # run ALTER TABLE statements manually against the /data/signage.db volume.
+    conn = get_db()
+    schema_path = Path(__file__).parent / "schema.sql"
+    conn.executescript(schema_path.read_text())
+    conn.commit()
+    conn.close()
+```
+
+---
+
 *Rule: every future edit session must append a new dated section to this file showing before/after for every changed snippet.*

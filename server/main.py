@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from pathlib import Path
+import shutil
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -8,6 +9,18 @@ from .auth import hash_password
 from .config import settings
 from .routers import auth_router, branches_router, displays_router, case_studies_router, uploads_router, ambient_router
 import json
+
+
+def backup_db():
+    """Rotate backups before startup: signage.db → .bak1 → .bak2. Keeps last 2 backups."""
+    db_path = Path(settings.DATABASE_PATH)
+    if not db_path.exists():
+        return
+    bak1 = Path(str(db_path) + '.bak1')
+    bak2 = Path(str(db_path) + '.bak2')
+    if bak1.exists():
+        bak1.replace(bak2)
+    shutil.copy2(db_path, bak1)
 
 
 def seed_db():
@@ -98,6 +111,7 @@ def seed_db():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    backup_db()
     init_db()
     seed_db()
     yield

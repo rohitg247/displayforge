@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+venv/
+
+# Database and uploaded media — must live on the Docker volume, never baked into the image
+server/signage.db
+server/signage.db.bak1
+server/signage.db.bak2
+server/uploads/
+
+# Frontend build artifacts and dependencies
+node_modules/
+dist/
+
+# Environment and secrets
+.env
+
+# Git and editor
+.git/
+.claude/
