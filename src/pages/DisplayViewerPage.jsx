@@ -13,7 +13,6 @@ import about3 from '@/assets/About_3.png';
 import about4 from '@/assets/About_4.png';
 import colorBand from '@/assets/ColorBand.png';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 const aboutImages = [about1, about2, about3, about4];
 const SECTIONS = ['home', 'about', 'caseStudies', 'solutions'];
 
@@ -82,7 +81,7 @@ export function DisplayViewerPage() {
 
   const getImageUrl = (path) => {
     if (!path) return null;
-    if (path.startsWith('/uploads/')) return `${API_BASE}${path}`;
+    if (path.startsWith('/uploads/')) return path;
     return path;
   };
 

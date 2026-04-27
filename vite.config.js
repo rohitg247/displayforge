@@ -10,6 +10,18 @@ export default defineConfig(({ mode }) => ({
     hmr: {
       overlay: false,
     },
+    proxy: {
+      '/api':     { target: process.env.VITE_API_URL || 'http://localhost:8000', changeOrigin: true },
+      '/uploads': { target: process.env.VITE_API_URL || 'http://localhost:8000', changeOrigin: true },
+    },
+  },
+  preview: {
+    port: 3200,
+    host: '::',
+    proxy: {
+      '/api':     { target: process.env.VITE_API_URL || 'http://localhost:8888', changeOrigin: true },
+      '/uploads': { target: process.env.VITE_API_URL || 'http://localhost:8888', changeOrigin: true },
+    },
   },
   plugins: [react(), mode === "development" && componentTagger()].filter(Boolean),
   resolve: {

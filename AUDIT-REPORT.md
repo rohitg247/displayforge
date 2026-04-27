@@ -116,3 +116,44 @@ No outdated/security issues.
 
 Audit complete – codebase unchanged.
 
+---
+
+## Fix: 5 Display Viewer Issues
+**Date:** 27 April 2026
+**Time:** 12:22
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/pages/AmbientViewerPage.jsx` | Media src changed to relative URL, color band extracted to always-visible, announcement bar padding/fonts reduced, load-event-driven layer activation, preload="auto" added to video |
+| `src/pages/DisplayViewerPage.jsx` | getImageUrl changed to relative URL, removed unused API_BASE |
+| `src/services/api.js` | Fallback port corrected from 8000 to 8888 |
+| `vite.config.js` | Added full preview block with port 3200, host, and proxy for /api and /uploads |
+| `src/App.jsx` | Added position="top-right" to Sonner Toaster |
+
+### Issues Resolved
+1. Media not displaying on TV — relative URLs + vite proxy
+2. Color band now always visible at full width bottom
+3. Announcement bar height reduced
+4. Toast position changed to top-right
+5. Black screen flash on media loop eliminated via onCanPlay/onLoad activation
+
+---
+
+## Fix: 4 Follow-up Fixes
+**Date:** 27 April 2026
+**Time:** 13:24
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/pages/AmbientViewerPage.jsx` | IMAGE_DURATION reduced from 8000ms to 5000ms |
+| `src/pages/AmbientDisplaysPage.jsx` | `await fetchDisplays()` in handlePublishAndSetLive for instant "Live" badge update after publish; `await fetchMedia()` in handleUpload and handleDeleteMedia for instant media grid update |
+| `vite.config.js` | Added proxy for `/api` and `/uploads` to `server` block (local dev) targeting `process.env.VITE_API_URL \|\| 'http://localhost:8000'` |
+
+### Issues Resolved
+1. Image display duration reduced from 8s to 5s
+2. Publish now reflects instantly in admin panel (no manual refresh needed)
+3. Uploaded and deleted media now appear/disappear instantly in the media grid
+4. View and Preview links now work in local development via Vite dev server proxy
+

@@ -104,7 +104,7 @@ export function AmbientDisplaysPage() {
     try {
       await api.uploadAmbientMedia(expandedId, files, activeTab);
       toast.success('Media uploaded');
-      fetchMedia(expandedId, activeTab);
+      await fetchMedia(expandedId, activeTab);
       fetchDisplays();
     } catch (err) { toast.error(err.message); }
     e.target.value = '';
@@ -114,7 +114,7 @@ export function AmbientDisplaysPage() {
     try {
       await api.deleteAmbientMedia(mediaId);
       toast.success('Media deleted');
-      fetchMedia(expandedId, activeTab);
+      await fetchMedia(expandedId, activeTab);
       fetchDisplays();
     } catch (err) { toast.error(err.message); }
   };
@@ -124,7 +124,7 @@ export function AmbientDisplaysPage() {
     try {
       await api.publishPlaylist(displayId, activeTab);
       toast.success(`Playlist ${activeTab} published`);
-      fetchDisplays();
+      await fetchDisplays();
       fetchMedia(displayId, activeTab);
     } catch (err) { toast.error(err.message); }
   };

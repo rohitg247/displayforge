@@ -4,8 +4,7 @@ import { api } from '@/services/api';
 import { toast } from '@/components/ui/sonner';
 
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
-const IMAGE_DURATION = 8000;
+const IMAGE_DURATION = 5000;
 const FADE_DURATION = 800;
 const POLL_INTERVAL = 5000;
 
@@ -29,6 +28,8 @@ export function AmbientViewerPage() {
   const videoRefs = [useRef(null), useRef(null)];
   const timerRef = useRef(null);
   const initializedRef = useRef(false);
+  const pendingActivateRef = useRef(null);
+  const loadFallbackRef = useRef(null);
 
 
   // Fetch display data
@@ -59,6 +60,26 @@ export function AmbientViewerPage() {
       console.error('Poll error:', err);
     }
   }, [id, isPreview, previewPlaylist]);
+
+
+  // Activate a layer only after its media has loaded; fallback after 2s for slow TV hardware
+  const handleLayerReady = useCallback((layerIdx) => {
+    if (pendingActivateRef.current !== layerIdx) return;
+    if (loadFallbackRef.current) { clearTimeout(loadFallbackRef.current); loadFallbackRef.current = null; }
+    pendingActivateRef.current = null;
+    setActiveLayer(layerIdx);
+  }, []);
+
+  const armLayerActivation = useCallback((layerIdx) => {
+    if (loadFallbackRef.current) clearTimeout(loadFallbackRef.current);
+    pendingActivateRef.current = layerIdx;
+    loadFallbackRef.current = setTimeout(() => {
+      if (pendingActivateRef.current === layerIdx) {
+        pendingActivateRef.current = null;
+        setActiveLayer(layerIdx);
+      }
+    }, 2000);
+  }, []);
 
 
   // Initial fetch + polling
@@ -95,15 +116,14 @@ export function AmbientViewerPage() {
           next[inactiveLayer] = 0;
           return next;
         });
-        // Small delay to let src load before fading
-        setTimeout(() => setActiveLayer(inactiveLayer), 50);
+        armLayerActivation(inactiveLayer);
       }
       return true;
     }
 
     pendingDataRef.current = null;
     return false;
-  }, [activeLayer]);
+  }, [activeLayer, armLayerActivation]);
 
 
   // Advance to next media
@@ -129,16 +149,15 @@ export function AmbientViewerPage() {
     currentIdxRef.current = nextIdx;
     const inactiveLayer = activeLayer === 0 ? 1 : 0;
 
-    // Preload on inactive layer
+    // Load on inactive layer, activate only when media is ready
     setLayerMedia(prev => {
       const next = [...prev];
       next[inactiveLayer] = nextIdx;
       return next;
     });
 
-    // Small delay for preload, then fade
-    setTimeout(() => setActiveLayer(inactiveLayer), 50);
-  }, [activeLayer, applyPendingIfNeeded]);
+    armLayerActivation(inactiveLayer);
+  }, [activeLayer, applyPendingIfNeeded, armLayerActivation]);
 
 
   // Schedule advance for images on the active layer
@@ -231,7 +250,7 @@ export function AmbientViewerPage() {
     if (mediaIdx === null || mediaIdx === undefined) return null;
     const item = media[mediaIdx];
     if (!item) return null;
-    const src = `${API_BASE}${item.file_path}`;
+    const src = item.file_path; // relative — proxied through vite preview to backend
     const isActive = activeLayer === layerIdx;
 
     return (
@@ -251,6 +270,8 @@ export function AmbientViewerPage() {
             src={src}
             muted
             playsInline
+            preload="auto"
+            onCanPlay={() => handleLayerReady(layerIdx)}
             onEnded={isActive ? handleVideoEnd : undefined}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
           />
@@ -258,6 +279,7 @@ export function AmbientViewerPage() {
           <img
             src={src}
             alt=""
+            onLoad={() => handleLayerReady(layerIdx)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
           />
         )}
@@ -337,73 +359,74 @@ export function AmbientViewerPage() {
           </div>
         )}
 
-        {/* Announcement overlay */}
+        {/* Announcement overlay — sits just above the color band */}
         {showAnnouncement && (
           <div
             style={{
               position: 'absolute',
-              bottom: 0,
+              bottom: 'clamp(5px, 0.9vh, 10px)',
               left: '50%',
               transform: 'translateX(-50%)',
               width: '85%',
               zIndex: 10,
             }}
           >
-            {/* Welcome box */}
             <div
               style={{
                 background: 'rgba(5, 30, 50, 0.9)',
                 borderRadius: '15px 15px 0 0',
-                padding: 'clamp(12px, 2vh, 26px) 0',
+                padding: 'clamp(6px, 1vh, 14px) 0',
                 textAlign: 'center',
                 color: '#ffffff',
               }}
             >
-              <div style={{ fontSize: 'clamp(11px, 1.4vw, 18px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}>
+              <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}>
                 {announcementLabel}
               </div>
               {announcementName && (
-                <div style={{ fontSize: 'clamp(16px, 2.2vw, 30px)', fontWeight: 700, marginBottom: 2 }}>
+                <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}>
                   {announcementName}
                 </div>
               )}
               {announcementTitle && (
-                <div style={{ fontSize: 'clamp(13px, 1.6vw, 22px)', fontWeight: 700 }}>
+                <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}>
                   {announcementTitle}
                 </div>
               )}
             </div>
-
-            {/* Color band — CSS only, animated marquee */}
-            <div
-              style={{
-                width: '100%',
-                height: 'clamp(5px, 0.9vh, 10px)',
-                overflow: 'hidden',
-                position: 'relative',
-              }}
-            >
-              <div
-                style={{
-                  display: 'flex',
-                  width: '200%',
-                  height: '100%',
-                  animation: 'colorband-scroll 10s linear infinite',
-                }}
-              >
-                {/* Duplicate segments for seamless loop */}
-                {[0, 1].map((set) => (
-                  <div key={set} style={{ display: 'flex', width: '50%', height: '100%' }}>
-                    <div style={{ flex: 1, background: '#F39200' }} />
-                    <div style={{ flex: 1, background: '#78A22F' }} />
-                    <div style={{ flex: 1, background: '#E30613' }} />
-                    <div style={{ flex: 1, background: '#009EE3' }} />
-                  </div>
-                ))}
-              </div>
-            </div>
           </div>
         )}
+
+        {/* Color band — always visible, full width, pinned to bottom */}
+        <div
+          style={{
+            position: 'absolute',
+            bottom: 0,
+            left: 0,
+            width: '100%',
+            height: 'clamp(5px, 0.9vh, 10px)',
+            overflow: 'hidden',
+            zIndex: 10,
+          }}
+        >
+          <div
+            style={{
+              display: 'flex',
+              width: '200%',
+              height: '100%',
+              animation: 'colorband-scroll 10s linear infinite',
+            }}
+          >
+            {[0, 1].map((set) => (
+              <div key={set} style={{ display: 'flex', width: '50%', height: '100%' }}>
+                <div style={{ flex: 1, background: '#F39200' }} />
+                <div style={{ flex: 1, background: '#78A22F' }} />
+                <div style={{ flex: 1, background: '#E30613' }} />
+                <div style={{ flex: 1, background: '#009EE3' }} />
+              </div>
+            ))}
+          </div>
+        </div>
       </div>
 
       <style>{`
