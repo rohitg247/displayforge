@@ -265,14 +265,14 @@ export function AmbientDisplaysPage() {
                         <ActisButton
                           variant="outline"
                           size="sm"
-                          onClick={() => window.open(`/ambient/${display.id}?preview=true&playlist=${activeTab}`, '_blank')}
+                          onClick={() => window.open(`/${display.branch_id}/2/${display.id}?preview=true&playlist=${activeTab}`, '_blank')}
                         >
                           <Eye size={14} /> Preview
                         </ActisButton>
                         <ActisButton
                           variant="outline"
                           size="sm"
-                          onClick={() => window.open(`/ambient/${display.id}`, '_blank')}
+                          onClick={() => window.open(`/${display.branch_id}/2/${display.id}`, '_blank')}
                         >
                           <Tv2 size={14} /> View
                         </ActisButton>

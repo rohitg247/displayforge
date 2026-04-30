@@ -175,3 +175,28 @@ Audit complete – codebase unchanged.
 2. Container startup now rotates backups: `signage.db → .bak1 → .bak2` (max 2 backups kept on the `/data` volume)
 3. `init_db()` confirmed safe for production — `CREATE TABLE IF NOT EXISTS` only, no DROP TABLE; schema change policy documented in code
 
+
+---
+
+## Phase 2: URL Redesign + AmbientViewer Stabilisation
+**Date:** 29 April 2026
+**Time:** Session 4
+
+### Files Modified
+| File | Change |
+|------|--------|
+| `src/App.jsx` | Replaced `/branch/:id` and `/ambient/:id` routes with `/:branchId/1/:id` (DisplayViewerPage) and `/:branchId/2/:id` (AmbientViewerPage) |
+| `src/pages/AmbientDisplaysPage.jsx` | Preview and View `window.open` calls updated to new URL format using `display.branch_id` |
+| `src/pages/CaseStudyEditorPage.jsx` | Derived `branchId` from `state.branches`; Preview `window.open` updated to new URL format |
+| `src/pages/AmbientViewerPage.jsx` | Full rewrite: state-machine playback engine, `layerSeq` forced remount, video instant-cut, orientation-aware color bar, all race conditions fixed |
+| `src/pages/AmbientViewerPage_New_Ver.jsx` | Deleted (merged into AmbientViewerPage.jsx) |
+
+### Issues Resolved
+1. Viewer URLs now encode branch and display-type: `/:branchId/:displayType/:displayId`
+2. ID stability confirmed — SQLite AUTOINCREMENT guarantees IDs never reused after deletion
+3. Even-item playlist loop reset stall fixed — `layerSeq` key forces DOM remount so `onCanPlay`/`onLoad` always fires
+4. Media skipping fixed — `transitionStateRef` gate prevents `handleVideoEnd` firing during ongoing transition
+5. Video transitions are now instant cuts (no opacity fade); image-to-image crossfade retained at 500ms
+6. Initial load bug fixed — `expectedLayerRef` allows layer 0's `onCanPlay` to be accepted during init
+7. Stale closure bug fixed — all playback callbacks use `activeLayerRef` + stable `[]` deps
+8. Color bar height is now orientation-aware: portrait `clamp(8px, 1.35vh, 15px)`, landscape `clamp(10px, 1.8vh, 20px)`

@@ -40,6 +40,8 @@ export function CaseStudyEditorPage() {
     .flatMap((b) => b.displays)
     .find((d) => d.id === Number(displayId));
 
+  const branchId = state.branches.find(b => b.displays.some(d => d.id === Number(displayId)))?.id;
+
   const caseStudies = display?.pages.caseStudies || [];
 
   useEffect(() => {
@@ -218,7 +220,7 @@ export function CaseStudyEditorPage() {
         </div>
         <ActisButton
           variant="primary"
-          onClick={() => window.open(`/branch/${displayId}?preview=true`, '_blank')}
+          onClick={() => window.open(`/${branchId}/1/${displayId}?preview=true`, '_blank')}
         >
           <Eye size={18} />
           Preview

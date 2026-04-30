@@ -3,9 +3,11 @@ import { useParams, useSearchParams } from 'react-router-dom';
 import { api } from '@/services/api';
 import { toast } from '@/components/ui/sonner';
 
+
 const IMAGE_DURATION = 5000;
-const CROSSFADE_DURATION = 500;
+const FADE_DURATION = 800;
 const POLL_INTERVAL = 5000;
+
 
 export function AmbientViewerPage() {
   const { id } = useParams();
@@ -15,150 +17,171 @@ export function AmbientViewerPage() {
 
   const [display, setDisplay] = useState(null);
   const [media, setMedia] = useState([]);
-  const [activeLayer, setActiveLayer] = useState(0);
-  const [layerMedia, setLayerMedia] = useState([null, null]);
-  const [layerSeq, setLayerSeq] = useState([0, 0]);
-  const [publishing, setPublishing] = useState(false);
+  const [activeLayer, setActiveLayer] = useState(0); // 0 or 1
+  const [layerMedia, setLayerMedia] = useState([null, null]); // media index for each layer
+  const [publishing, setPublishing] = useState(false); // ✅ NEW: publish loading state
 
-  const mediaRef = useRef([]);
-  const currentIdxRef = useRef(0);
-  const nextIndexRef = useRef(null);
-  const timerRef = useRef(null);
-  const transitionStateRef = useRef('INIT');
-  const initializedRef = useRef(false);
   const pendingDataRef = useRef(null);
-  const activeLayerRef = useRef(0);   // always-current mirror of activeLayer state
-  const expectedLayerRef = useRef(0); // which layer index we're waiting to fire onCanPlay/onLoad
+  const currentIdxRef = useRef(0);
+  const mediaRef = useRef([]);
+  const displayRef = useRef(null);
   const videoRefs = [useRef(null), useRef(null)];
+  const timerRef = useRef(null);
+  const initializedRef = useRef(false);
+  const pendingActivateRef = useRef(null);
+  const loadFallbackRef = useRef(null);
 
-  /* ---------------- FETCH ---------------- */
 
+  // Fetch display data
   const fetchData = useCallback(async () => {
     try {
+      // ✅ CHANGE 1: pass isPreview as admin flag so preview sees draft media
       const data = await api.getAmbientDisplay(Number(id), null, isPreview);
       const playlistToUse = isPreview ? previewPlaylist : (data.active_playlist || 'A');
       const filteredMedia = (data.media || []).filter(m => m.playlist === playlistToUse);
 
       if (!initializedRef.current) {
+        // First load — apply immediately
         setDisplay(data);
+        displayRef.current = data;
         setMedia(filteredMedia);
         mediaRef.current = filteredMedia;
-
         if (filteredMedia.length > 0) {
           currentIdxRef.current = 0;
-          nextIndexRef.current = 0;
-          expectedLayerRef.current = 0;
-          transitionStateRef.current = 'LOADING_NEXT';
           setLayerMedia([0, null]);
-          setLayerSeq(prev => [prev[0] + 1, prev[1]]);
+          setActiveLayer(0);
         }
-
         initializedRef.current = true;
       } else {
-        pendingDataRef.current = { display: data, media: filteredMedia };
+        // Store for next transition
+        pendingDataRef.current = { display: data, media: filteredMedia, playlist: playlistToUse };
       }
     } catch (err) {
-      console.error(err);
+      console.error('Poll error:', err);
     }
   }, [id, isPreview, previewPlaylist]);
 
+
+  // Activate a layer only after its media has loaded; fallback after 2s for slow TV hardware
+  const handleLayerReady = useCallback((layerIdx) => {
+    if (pendingActivateRef.current !== layerIdx) return;
+    if (loadFallbackRef.current) { clearTimeout(loadFallbackRef.current); loadFallbackRef.current = null; }
+    pendingActivateRef.current = null;
+    setActiveLayer(layerIdx);
+  }, []);
+
+  const armLayerActivation = useCallback((layerIdx) => {
+    if (loadFallbackRef.current) clearTimeout(loadFallbackRef.current);
+    pendingActivateRef.current = layerIdx;
+    loadFallbackRef.current = setTimeout(() => {
+      if (pendingActivateRef.current === layerIdx) {
+        pendingActivateRef.current = null;
+        setActiveLayer(layerIdx);
+      }
+    }, 2000);
+  }, []);
+
+
+  // Initial fetch + polling
   useEffect(() => {
     fetchData();
     const interval = setInterval(fetchData, POLL_INTERVAL);
     return () => clearInterval(interval);
   }, [fetchData]);
 
-  /* ---------------- PLAYBACK ENGINE ---------------- */
 
-  // No activeLayer in deps — all reactive values accessed via refs (stable callback).
+  // Apply pending data if media sequence changed
   const applyPendingIfNeeded = useCallback(() => {
     const pending = pendingDataRef.current;
     if (!pending) return false;
 
+    // Update display info always (announcement, orientation etc)
+    setDisplay(pending.display);
+    displayRef.current = pending.display;
+
+    // Check if media sequence actually changed
     const currentPaths = mediaRef.current.map(m => m.file_path).join(',');
     const newPaths = pending.media.map(m => m.file_path).join(',');
-
-    setDisplay(pending.display);
 
     if (currentPaths !== newPaths) {
       setMedia(pending.media);
       mediaRef.current = pending.media;
       currentIdxRef.current = 0;
-      nextIndexRef.current = 0;
-      transitionStateRef.current = 'LOADING_NEXT';
-
-      const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-      expectedLayerRef.current = inactiveLayer;
-
-      setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = 0; return next; });
-      setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
-
       pendingDataRef.current = null;
+
+      if (pending.media.length > 0) {
+        const inactiveLayer = activeLayer === 0 ? 1 : 0;
+        setLayerMedia(prev => {
+          const next = [...prev];
+          next[inactiveLayer] = 0;
+          return next;
+        });
+        armLayerActivation(inactiveLayer);
+      }
       return true;
     }
 
     pendingDataRef.current = null;
     return false;
-  }, []);
+  }, [activeLayer, armLayerActivation]);
 
-  const requestTransition = useCallback(() => {
-    if (transitionStateRef.current !== 'DISPLAYING') return;
 
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-
+  // Advance to next media
+  const advance = useCallback(() => {
+    // Try applying pending data first
     if (applyPendingIfNeeded()) return;
 
     const currentMedia = mediaRef.current;
-    if (currentMedia.length <= 1) return;
-
-    transitionStateRef.current = 'LOADING_NEXT';
+    if (currentMedia.length <= 1) {
+      // Still check for pending updates even with single media
+      applyPendingIfNeeded();
+      if (currentMedia.length === 1) {
+        // Re-trigger timer for single image to keep checking
+        const item = currentMedia[0];
+        if (item?.media_type === 'image') {
+          timerRef.current = setTimeout(advance, IMAGE_DURATION);
+        }
+      }
+      return;
+    }
 
     const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
-    nextIndexRef.current = nextIdx;
+    currentIdxRef.current = nextIdx;
+    const inactiveLayer = activeLayer === 0 ? 1 : 0;
 
-    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-    expectedLayerRef.current = inactiveLayer;
+    // Load on inactive layer, activate only when media is ready
+    setLayerMedia(prev => {
+      const next = [...prev];
+      next[inactiveLayer] = nextIdx;
+      return next;
+    });
 
-    setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = nextIdx; return next; });
-    setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
-  }, [applyPendingIfNeeded]);
+    armLayerActivation(inactiveLayer);
+  }, [activeLayer, applyPendingIfNeeded, armLayerActivation]);
 
-  // deps [] — requestTransition is stable (depends only on stable applyPendingIfNeeded)
-  const startDisplayClock = useCallback((item) => {
+
+  // Schedule advance for images on the active layer
+  useEffect(() => {
+    if (!media.length) return;
+    const idx = layerMedia[activeLayer];
+    if (idx === null || idx === undefined) return;
+    const item = media[idx];
     if (!item) return;
-    transitionStateRef.current = 'DISPLAYING';
+
     if (item.media_type === 'image') {
-      timerRef.current = setTimeout(() => { requestTransition(); }, IMAGE_DURATION);
+      timerRef.current = setTimeout(advance, IMAGE_DURATION);
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+    return () => clearTimeout(timerRef.current);
+  }, [activeLayer, layerMedia, media, advance]);
 
-  const handleLayerReady = useCallback((layerIdx) => {
-    if (transitionStateRef.current !== 'LOADING_NEXT') return;
-    if (layerIdx !== expectedLayerRef.current) return; // replaces the old inactiveLayer check
 
-    transitionStateRef.current = 'FADING';
-    activeLayerRef.current = layerIdx;
-    setActiveLayer(layerIdx);
-    currentIdxRef.current = nextIndexRef.current;
-
-    const nextItem = mediaRef.current[currentIdxRef.current];
-
-    if (nextItem?.media_type !== 'image') {
-      // Video has no CSS fade — enter DISPLAYING immediately so handleVideoEnd is accepted
-      transitionStateRef.current = 'DISPLAYING';
-    } else {
-      // Wait for the opacity crossfade to complete before starting the display clock
-      setTimeout(() => { startDisplayClock(nextItem); }, CROSSFADE_DURATION);
-    }
-  }, [startDisplayClock]);
-
+  // Handle video end
   const handleVideoEnd = useCallback(() => {
-    if (transitionStateRef.current !== 'DISPLAYING') return;
-    requestTransition();
-  }, [requestTransition]);
+    advance();
+  }, [advance]);
 
-  /* ---------------- VIDEO AUTOPLAY ---------------- */
 
+  // Auto-play video on active layer
   useEffect(() => {
     const idx = layerMedia[activeLayer];
     if (idx === null || idx === undefined || !media[idx]) return;
@@ -171,8 +194,8 @@ export function AmbientViewerPage() {
     }
   }, [activeLayer, layerMedia, media]);
 
-  /* ---------------- PUBLISH ---------------- */
 
+  // ✅ NEW: Publish handler — called from preview overlay button
   const handlePublish = useCallback(async () => {
     setPublishing(true);
     try {
@@ -186,15 +209,9 @@ export function AmbientViewerPage() {
     }
   }, [id, previewPlaylist]);
 
-  /* ---------------- RENDER ---------------- */
 
+  // Orientation container styles
   const orientation = display?.orientation || 'landscape';
-
-  const colorBarHeight =
-    orientation === 'portrait'
-      ? 'clamp(8px, 1.35vh, 15px)'
-      : 'clamp(10px, 1.8vh, 20px)';
-
   const containerStyle = useMemo(() => {
     if (orientation === 'portrait') {
       return {
@@ -209,12 +226,14 @@ export function AmbientViewerPage() {
     return {
       position: 'relative',
       width: '100%',
+      maxWidth: '100%',
       aspectRatio: '16/9',
       maxHeight: '100vh',
       margin: 'auto',
       overflow: 'hidden',
     };
   }, [orientation]);
+
 
   if (!display || !media.length) {
     return (
@@ -231,7 +250,7 @@ export function AmbientViewerPage() {
     if (mediaIdx === null || mediaIdx === undefined) return null;
     const item = media[mediaIdx];
     if (!item) return null;
-    const src = item.file_path;
+    const src = item.file_path; // relative — proxied through vite preview to backend
     const isActive = activeLayer === layerIdx;
 
     return (
@@ -241,13 +260,12 @@ export function AmbientViewerPage() {
           position: 'absolute',
           inset: 0,
           opacity: isActive ? 1 : 0,
-          transition: item.media_type === 'image' ? `opacity ${CROSSFADE_DURATION}ms ease` : 'none',
+          transition: `opacity ${FADE_DURATION}ms ease-in-out`,
           zIndex: isActive ? 2 : 1,
         }}
       >
         {item.media_type === 'video' ? (
           <video
-            key={layerSeq[layerIdx]}
             ref={videoRefs[layerIdx]}
             src={src}
             muted
@@ -259,7 +277,6 @@ export function AmbientViewerPage() {
           />
         ) : (
           <img
-            key={layerSeq[layerIdx]}
             src={src}
             alt=""
             onLoad={() => handleLayerReady(layerIdx)}
@@ -275,6 +292,7 @@ export function AmbientViewerPage() {
   const announcementTitle = display.announcement_title || '';
   const showAnnouncement = !!display.announcement_enabled && (announcementName || announcementTitle);
 
+
   return (
     <div
       style={{
@@ -288,9 +306,12 @@ export function AmbientViewerPage() {
       }}
     >
       <div style={containerStyle}>
+        {/* Layer 0 */}
         {renderLayer(0)}
+        {/* Layer 1 */}
         {renderLayer(1)}
 
+        {/* ✅ CHANGE 2: Preview badge + Publish Live button (only shown in preview mode) */}
         {isPreview && (
           <div
             style={{
@@ -338,11 +359,12 @@ export function AmbientViewerPage() {
           </div>
         )}
 
+        {/* Announcement overlay — sits just above the color band */}
         {showAnnouncement && (
           <div
             style={{
               position: 'absolute',
-              bottom: colorBarHeight,
+              bottom: 'clamp(5px, 0.9vh, 10px)',
               left: '50%',
               transform: 'translateX(-50%)',
               width: '85%',
@@ -375,13 +397,14 @@ export function AmbientViewerPage() {
           </div>
         )}
 
+        {/* Color band — always visible, full width, pinned to bottom */}
         <div
           style={{
             position: 'absolute',
             bottom: 0,
             left: 0,
             width: '100%',
-            height: colorBarHeight,
+            height: 'clamp(5px, 0.9vh, 10px)',
             overflow: 'hidden',
             zIndex: 10,
           }}

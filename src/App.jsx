@@ -28,8 +28,8 @@ const App = () => (
           <Routes>
             <Route path="/" element={<Navigate to="/admin/login" replace />} />
             <Route path="/admin/login" element={<LoginPage />} />
-            <Route path="/branch/:id" element={<DisplayViewerPage />} />
-            <Route path="/ambient/:id" element={<AmbientViewerPage />} />
+            <Route path="/:branchId/1/:id" element={<DisplayViewerPage />} />
+            <Route path="/:branchId/2/:id" element={<AmbientViewerPage />} />
             <Route
               path="/admin"
               element={

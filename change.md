@@ -451,3 +451,161 @@ def init_db():
 ---
 
 *Rule: every future edit session must append a new dated section to this file showing before/after for every changed snippet.*
+
+---
+
+## Session 4 — 29 April 2026
+**Topic:** Phase 2 — URL Redesign + AmbientViewer Stabilisation
+
+---
+
+### 1. `src/App.jsx` — Replace viewer routes
+
+**Before:**
+```jsx
+<Route path="/branch/:id" element={<DisplayViewerPage />} />
+<Route path="/ambient/:id" element={<AmbientViewerPage />} />
+```
+**After:**
+```jsx
+<Route path="/:branchId/1/:id" element={<DisplayViewerPage />} />
+<Route path="/:branchId/2/:id" element={<AmbientViewerPage />} />
+```
+
+---
+
+### 2. `src/pages/AmbientDisplaysPage.jsx` — Update Preview window.open (line 268)
+
+**Before:**
+```js
+onClick={() => window.open(`/ambient/${display.id}?preview=true&playlist=${activeTab}`, '_blank')}
+```
+**After:**
+```js
+onClick={() => window.open(`/${display.branch_id}/2/${display.id}?preview=true&playlist=${activeTab}`, '_blank')}
+```
+
+---
+
+### 3. `src/pages/AmbientDisplaysPage.jsx` — Update View window.open (line 275)
+
+**Before:**
+```js
+onClick={() => window.open(`/ambient/${display.id}`, '_blank')}
+```
+**After:**
+```js
+onClick={() => window.open(`/${display.branch_id}/2/${display.id}`, '_blank')}
+```
+
+---
+
+### 4. `src/pages/CaseStudyEditorPage.jsx` — Add branchId derivation (after line 41)
+
+**Before:** *(line did not exist)*
+
+**After:**
+```js
+const branchId = state.branches.find(b => b.displays.some(d => d.id === Number(displayId)))?.id;
+```
+
+---
+
+### 5. `src/pages/CaseStudyEditorPage.jsx` — Update Preview window.open (line 221)
+
+**Before:**
+```js
+onClick={() => window.open(`/branch/${displayId}?preview=true`, '_blank')}
+```
+**After:**
+```js
+onClick={() => window.open(`/${branchId}/1/${displayId}?preview=true`, '_blank')}
+```
+
+---
+
+### 6. `src/pages/AmbientViewerPage.jsx` — Full rewrite (state-machine playback engine)
+
+The file was replaced entirely. Key changes versus the previous version:
+
+#### 6a. State machine via `transitionStateRef`
+**Before:** Transition authority split across multiple independent mechanisms (setTimeout 50ms, onEnded, onLoad/onCanPlay, polling).  
+**After:** Single `transitionStateRef` with states `INIT → LOADING_NEXT → FADING → DISPLAYING`. Every transition point checks the current state before acting.
+
+#### 6b. `layerSeq` forced media remount
+**Before:** *(not present)*  
+**After:**
+```js
+const [layerSeq, setLayerSeq] = useState([0, 0]);
+// ...
+setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
+// In renderLayer:
+<video key={layerSeq[layerIdx]} ... />
+<img key={layerSeq[layerIdx]} ... />
+```
+Forces DOM remount on every intentional media load — ensures `onCanPlay`/`onLoad` fires even when the same `src` returns on the same layer (even-item playlist loop reset bug).
+
+#### 6c. `activeLayerRef` + `expectedLayerRef` — stable callbacks, no stale closures
+**Before:** Callbacks had `activeLayer` in closure deps and were recreated on every transition. `startDisplayClock` (deps `[]`) called a stale `requestTransition` after the first transition.  
+**After:**
+```js
+const activeLayerRef = useRef(0);   // always-current mirror of activeLayer state
+const expectedLayerRef = useRef(0); // which layer we're waiting to fire ready
+```
+`applyPendingIfNeeded`, `requestTransition`, `handleLayerReady` all use `activeLayerRef.current` instead of captured `activeLayer`. All callbacks are stable (no stale closure issue).
+
+#### 6d. `handleLayerReady` guard — fixes initial load
+**Before:**
+```js
+const inactiveLayer = activeLayer === 0 ? 1 : 0;
+if (layerIdx !== inactiveLayer) return;  // blocked layer 0 on init
+```
+**After:**
+```js
+if (layerIdx !== expectedLayerRef.current) return;  // expectedLayerRef=0 at init
+```
+
+#### 6e. Video transitions — skip FADING delay
+**Before:** Both image and video waited `CROSSFADE_DURATION` (500ms) in FADING state before entering DISPLAYING.  
+**After:**
+```js
+if (nextItem?.media_type !== 'image') {
+  transitionStateRef.current = 'DISPLAYING'; // instant for video
+} else {
+  setTimeout(() => { startDisplayClock(nextItem); }, CROSSFADE_DURATION);
+}
+```
+
+#### 6f. CSS transition — images only
+**Before:**
+```js
+transition: `opacity ${FADE_DURATION}ms ease-in-out`,  // applied to all layers
+```
+**After:**
+```js
+transition: item.media_type === 'image' ? `opacity ${CROSSFADE_DURATION}ms ease` : 'none',
+```
+
+#### 6g. Color bar height — orientation-aware
+**Before:**
+```js
+height: 'clamp(5px, 0.9vh, 10px)',  // same for all orientations
+```
+**After:**
+```js
+const colorBarHeight =
+  orientation === 'portrait'
+    ? 'clamp(8px, 1.35vh, 15px)'   // 1.5× original
+    : 'clamp(10px, 1.8vh, 20px)';  // 2× original
+```
+Announcement overlay `bottom` offset updated to `colorBarHeight` to stay above the band.
+
+#### 6h. `IMAGE_DURATION` and `FADE_DURATION` constants
+**Before:** `const IMAGE_DURATION = 5000; const FADE_DURATION = 800;`  
+**After:** `const IMAGE_DURATION = 5000; const CROSSFADE_DURATION = 500;`
+
+---
+
+### 7. `src/pages/AmbientViewerPage_New_Ver.jsx` — Deleted
+
+Reference implementation file removed after merge into `AmbientViewerPage.jsx`.
