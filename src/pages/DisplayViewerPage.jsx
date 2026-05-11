@@ -11,7 +11,7 @@ import about1 from '@/assets/About_1.png';
 import about2 from '@/assets/About_2.png';
 import about3 from '@/assets/About_3.png';
 import about4 from '@/assets/About_4.png';
-import colorBand from '@/assets/ColorBand.png';
+import colorBand from '@/assets/About_1.png';
 
 const aboutImages = [about1, about2, about3, about4];
 const SECTIONS = ['home', 'about', 'caseStudies', 'solutions'];
@@ -143,7 +143,7 @@ export function DisplayViewerPage() {
     alignItems: 'center',
     justifyContent: 'center',
     overflow: 'hidden',
-    padding: 'clamp(10px, 1vw, 18px)',
+    // padding: 'clamp(10px, 1vw, 18px)',
   };
 
   if (loading) {
@@ -413,7 +413,7 @@ export function DisplayViewerPage() {
                         style={{
                           width: '100%',
                           height: '100%',
-                          objectFit: 'contain',
+                          objectFit: 'cover',
                           objectPosition: 'center',
                           display: 'block',
                         }}

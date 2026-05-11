@@ -30,6 +30,16 @@ export function AmbientViewerPage() {
   const activeLayerRef = useRef(0);   // always-current mirror of activeLayer state
   const expectedLayerRef = useRef(0); // which layer index we're waiting to fire onCanPlay/onLoad
   const videoRefs = [useRef(null), useRef(null)];
+  const prebufferedLayerRef = useRef(null); // null | 0 | 1 — layer with video frozen at frame 0
+  const eventLogRef = useRef([]);           // rolling debug event log (last 15 entries)
+
+  const isDebug = searchParams.get('debug') === 'true';
+  const [, setDebugTick] = useState(0);
+
+  const logEvent = useCallback((label) => {
+    const ts = (performance.now() / 1000).toFixed(2);
+    eventLogRef.current = [`${ts}s — ${label}`, ...eventLogRef.current].slice(0, 15);
+  }, []);
 
   /* ---------------- FETCH ---------------- */
 
@@ -68,6 +78,12 @@ export function AmbientViewerPage() {
     return () => clearInterval(interval);
   }, [fetchData]);
 
+  useEffect(() => {
+    if (!isDebug) return;
+    const id = setInterval(() => setDebugTick(t => t + 1), 200);
+    return () => clearInterval(id);
+  }, [isDebug]);
+
   /* ---------------- PLAYBACK ENGINE ---------------- */
 
   // No activeLayer in deps — all reactive values accessed via refs (stable callback).
@@ -85,6 +101,7 @@ export function AmbientViewerPage() {
       mediaRef.current = pending.media;
       currentIdxRef.current = 0;
       nextIndexRef.current = 0;
+      prebufferedLayerRef.current = null;
       transitionStateRef.current = 'LOADING_NEXT';
 
       const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
@@ -106,7 +123,7 @@ export function AmbientViewerPage() {
 
     if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
 
-    if (applyPendingIfNeeded()) return;
+    if (applyPendingIfNeeded()) { prebufferedLayerRef.current = null; return; }
 
     const currentMedia = mediaRef.current;
     if (currentMedia.length <= 1) return;
@@ -123,18 +140,54 @@ export function AmbientViewerPage() {
     setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
   }, [applyPendingIfNeeded]);
 
-  // deps [] — requestTransition is stable (depends only on stable applyPendingIfNeeded)
+  // deps [] — requestTransition and logEvent are stable; setLayerMedia/setLayerSeq are stable setters
   const startDisplayClock = useCallback((item) => {
     if (!item) return;
     transitionStateRef.current = 'DISPLAYING';
+    logEvent(`startDisplayClock — ${item.file_path?.split('/').pop()}`);
+
     if (item.media_type === 'image') {
       timerRef.current = setTimeout(() => { requestTransition(); }, IMAGE_DURATION);
     }
+
+    // Pre-buffer next item on inactive layer immediately
+    const currentMedia = mediaRef.current;
+    if (currentMedia.length <= 1) return;
+
+    const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
+    nextIndexRef.current = nextIdx;
+    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
+    expectedLayerRef.current = inactiveLayer;
+    prebufferedLayerRef.current = null; // reset: new pre-buffer cycle starting
+
+    setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
+    setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
+    logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const handleLayerReady = useCallback((layerIdx) => {
+    // Case B: pre-buffer completion — fired while current item is still DISPLAYING
+    if (transitionStateRef.current === 'DISPLAYING') {
+      if (layerIdx !== expectedLayerRef.current) return;
+      const item = mediaRef.current[nextIndexRef.current];
+      logEvent(`onCanPlay/onLoad [${layerIdx}] — ${item?.file_path?.split('/').pop()}`);
+      if (item?.media_type === 'video') {
+        const vr = videoRefs[layerIdx].current;
+        if (vr) {
+          vr.play().catch(() => {}); // fire-and-forget
+          vr.pause();                // synchronous cancel — freeze in same microtask
+          vr.currentTime = 0;
+          logEvent(`play() called [${layerIdx}]`);
+          logEvent(`pause() called [${layerIdx}] (pre-buffer freeze)`);
+        }
+      }
+      prebufferedLayerRef.current = layerIdx;
+      return;
+    }
+
+    // Case A: normal transition — LOADING_NEXT → flip → DISPLAYING
     if (transitionStateRef.current !== 'LOADING_NEXT') return;
-    if (layerIdx !== expectedLayerRef.current) return; // replaces the old inactiveLayer check
+    if (layerIdx !== expectedLayerRef.current) return;
 
     transitionStateRef.current = 'FADING';
     activeLayerRef.current = layerIdx;
@@ -142,20 +195,39 @@ export function AmbientViewerPage() {
     currentIdxRef.current = nextIndexRef.current;
 
     const nextItem = mediaRef.current[currentIdxRef.current];
+    logEvent(`setActiveLayer → ${layerIdx}`);
 
     if (nextItem?.media_type !== 'image') {
-      // Video has no CSS fade — enter DISPLAYING immediately so handleVideoEnd is accepted
+      // Video: enter DISPLAYING immediately and kick off the pre-buffer cycle
       transitionStateRef.current = 'DISPLAYING';
+      startDisplayClock(nextItem);
     } else {
-      // Wait for the opacity crossfade to complete before starting the display clock
+      // Image: wait for CSS crossfade, then start display clock
       setTimeout(() => { startDisplayClock(nextItem); }, CROSSFADE_DURATION);
     }
-  }, [startDisplayClock]);
+  }, [startDisplayClock, logEvent]);
 
   const handleVideoEnd = useCallback(() => {
     if (transitionStateRef.current !== 'DISPLAYING') return;
+    logEvent(`onEnded [${activeLayerRef.current}]`);
+
+    if (prebufferedLayerRef.current !== null) {
+      // Fast path: pre-buffered video is frozen at frame 0 — instant flip
+      const readyLayer = prebufferedLayerRef.current;
+      currentIdxRef.current = nextIndexRef.current;
+      activeLayerRef.current = readyLayer;
+      prebufferedLayerRef.current = null;
+      transitionStateRef.current = 'DISPLAYING';
+      setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
+      logEvent(`setActiveLayer → ${readyLayer} (pre-buffer fast path)`);
+      const item = mediaRef.current[currentIdxRef.current];
+      startDisplayClock(item); // immediately pre-buffer the item after this one
+      return;
+    }
+
+    // Slow path: pre-buffer wasn't ready, fall back to normal transition
     requestTransition();
-  }, [requestTransition]);
+  }, [requestTransition, startDisplayClock, logEvent]);
 
   /* ---------------- VIDEO AUTOPLAY ---------------- */
 
@@ -290,6 +362,35 @@ export function AmbientViewerPage() {
       <div style={containerStyle}>
         {renderLayer(0)}
         {renderLayer(1)}
+
+        {isDebug && (
+          <div style={{
+            position: 'fixed', top: 0, left: 0, zIndex: 999,
+            pointerEvents: 'none', padding: 8,
+            background: 'rgba(0,0,0,0.78)', color: '#0f0',
+            fontFamily: 'monospace', fontSize: 10, lineHeight: 1.5,
+            maxWidth: 380,
+          }}>
+            <div>State: <b>{transitionStateRef.current}</b></div>
+            <div>Active Layer: <b>{activeLayerRef.current}</b></div>
+            <div>Pre-buffer: <b>{prebufferedLayerRef.current ?? 'none'}</b></div>
+            {[0, 1].map(li => {
+              const mIdx = layerMedia[li];
+              const fname = mIdx != null ? (mediaRef.current[mIdx]?.file_path?.split('/').pop() ?? '?') : '—';
+              return (
+                <div key={li}>
+                  L{li}: {fname}
+                  {prebufferedLayerRef.current === li ? '  PRE-BUFFERED' : ''}
+                  {activeLayerRef.current === li ? '  ACTIVE' : ''}
+                </div>
+              );
+            })}
+            <hr style={{ borderColor: '#0f04', margin: '4px 0' }} />
+            {eventLogRef.current.map((e, i) => (
+              <div key={i} style={{ opacity: Math.max(0.15, 1 - i * 0.065) }}>{e}</div>
+            ))}
+          </div>
+        )}
 
         {isPreview && (
           <div

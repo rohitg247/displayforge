@@ -20,9 +20,13 @@ export function DashboardPage() {
     }
   }, [activeTab]);
 
-  const handleViewDisplay = (displayId) => {
-    window.open(`/branch/${displayId}`, '_blank');
-  };
+  // const handleViewDisplay = (displayId) => {
+  //   window.open(`/branch/${displayId}`, '_blank');
+  // };
+
+  const handleViewDisplay = (branchId, displayId) => {
+    window.open(`/${branchId}/1/${displayId}`, '_blank');
+  };  
 
   const handleEditDisplay = (displayId) => {
     navigate(`/admin/displays/${displayId}/editor`);
@@ -148,7 +152,8 @@ export function DashboardPage() {
                         <ActisButton
                           variant="primary"
                           size="sm"
-                          onClick={() => handleViewDisplay(display.id)}
+                          onClick={() => handleViewDisplay(branch.id, display.id)}
+                          // onClick={() => handleViewDisplay(display.id)}
                           className="flex-1"
                         >
                           <Eye size={14} />
@@ -231,7 +236,8 @@ export function DashboardPage() {
                       <ActisButton
                         variant="primary"
                         size="sm"
-                        onClick={() => window.open(`/ambient/${d.id}`, '_blank')}
+                        onClick={() => window.open(`/${d.branch_id}/2/${d.id}`, '_blank')}
+                        // onClick={() => window.open(`/ambient/${d.id}`, '_blank')}
                         className="flex-1"
                       >
                         <Eye size={14} /> View
