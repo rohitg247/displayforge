@@ -32,6 +32,10 @@ export function AmbientViewerPage() {
   const videoRefs = [useRef(null), useRef(null)];
   const prebufferedLayerRef = useRef(null); // null | 0 | 1 — layer with video frozen at frame 0
   const eventLogRef = useRef([]);           // rolling debug event log (last 15 entries)
+  // True while the freeze sequence (play→pause→currentTime=0) is executing.
+  // Acts as a synchronous mutex: some WebKit/Tizen builds fire onCanPlay re-entrantly
+  // inside play() before JS yields, so expectedLayerRef = -1 alone is not sufficient.
+  const prebufferFrozenRef = useRef(false);
 
   const isDebug = searchParams.get('debug') === 'true';
   const [, setDebugTick] = useState(0);
@@ -118,29 +122,8 @@ export function AmbientViewerPage() {
     return false;
   }, []);
 
-  const requestTransition = useCallback(() => {
-    if (transitionStateRef.current !== 'DISPLAYING') return;
-
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
-
-    if (applyPendingIfNeeded()) { prebufferedLayerRef.current = null; return; }
-
-    const currentMedia = mediaRef.current;
-    if (currentMedia.length <= 1) return;
-
-    transitionStateRef.current = 'LOADING_NEXT';
-
-    const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
-    nextIndexRef.current = nextIdx;
-
-    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-    expectedLayerRef.current = inactiveLayer;
-
-    setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = nextIdx; return next; });
-    setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
-  }, [applyPendingIfNeeded]);
-
-  // deps [] — requestTransition and logEvent are stable; setLayerMedia/setLayerSeq are stable setters
+  // deps [] — requestTransition is captured via setTimeout closure (called after both are defined);
+  // setLayerMedia/setLayerSeq are stable React setters.
   const startDisplayClock = useCallback((item) => {
     if (!item) return;
     transitionStateRef.current = 'DISPLAYING';
@@ -159,21 +142,65 @@ export function AmbientViewerPage() {
     const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
     expectedLayerRef.current = inactiveLayer;
     prebufferedLayerRef.current = null; // reset: new pre-buffer cycle starting
+    prebufferFrozenRef.current = false; // reset mutex for new pre-buffer cycle
 
     setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
     setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
     logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  const requestTransition = useCallback(() => {
+    if (transitionStateRef.current !== 'DISPLAYING') return;
+
+    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+
+    if (applyPendingIfNeeded()) { prebufferedLayerRef.current = null; return; }
+
+    // Fast path: next video is already pre-buffered at frame 0 — flip instantly.
+    // Covers image→video transitions (including playlist loop reset) where requestTransition
+    // is the caller rather than handleVideoEnd.
+    if (prebufferedLayerRef.current !== null) {
+      const readyLayer = prebufferedLayerRef.current;
+      currentIdxRef.current = nextIndexRef.current;
+      activeLayerRef.current = readyLayer;
+      prebufferedLayerRef.current = null;
+      transitionStateRef.current = 'DISPLAYING';
+      setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
+      logEvent(`setActiveLayer → ${readyLayer} (pre-buffer fast path)`);
+      const item = mediaRef.current[currentIdxRef.current];
+      startDisplayClock(item);
+      return;
+    }
+
+    const currentMedia = mediaRef.current;
+    if (currentMedia.length <= 1) return;
+
+    transitionStateRef.current = 'LOADING_NEXT';
+
+    const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
+    nextIndexRef.current = nextIdx;
+
+    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
+    expectedLayerRef.current = inactiveLayer;
+
+    setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = nextIdx; return next; });
+    setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
+  }, [applyPendingIfNeeded, startDisplayClock, logEvent]);
+
   const handleLayerReady = useCallback((layerIdx) => {
     // Case B: pre-buffer completion — fired while current item is still DISPLAYING
     if (transitionStateRef.current === 'DISPLAYING') {
       if (layerIdx !== expectedLayerRef.current) return;
+      // Primary guard: freeze sequence is already in progress — block re-entry.
+      // Handles synchronous onCanPlay re-fires that occur inside play() on some
+      // WebKit/Tizen builds before JS yields back to the event loop.
+      if (prebufferFrozenRef.current) return;
       const item = mediaRef.current[nextIndexRef.current];
       logEvent(`onCanPlay/onLoad [${layerIdx}] — ${item?.file_path?.split('/').pop()}`);
       if (item?.media_type === 'video') {
         const vr = videoRefs[layerIdx].current;
         if (vr) {
+          prebufferFrozenRef.current = true; // set before play() — blocks re-entrant onCanPlay
           vr.play().catch(() => {}); // fire-and-forget
           vr.pause();                // synchronous cancel — freeze in same microtask
           vr.currentTime = 0;
@@ -182,6 +209,8 @@ export function AmbientViewerPage() {
         }
       }
       prebufferedLayerRef.current = layerIdx;
+      // Secondary guard: blocks async onCanPlay re-fires (future event-loop ticks).
+      expectedLayerRef.current = -1;
       return;
     }
 
