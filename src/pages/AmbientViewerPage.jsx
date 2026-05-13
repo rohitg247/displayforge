@@ -147,6 +147,26 @@ export function AmbientViewerPage() {
     setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
     setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
     logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
+
+    // Fallback for platforms (e.g. Tizen WebKit) where onCanPlay does not fire on hidden
+    // (inactive) layer videos. preload="auto" still causes decode; after 300ms treat the
+    // layer as pre-buffered even without onCanPlay confirmation.
+    // inactiveLayer is a local const — each call captures its own value in the closure.
+    // Three guards prevent a stale timeout from a previous cycle misfiring:
+    //   1. transitionStateRef === 'DISPLAYING'  — state hasn't changed
+    //   2. expectedLayerRef   === inactiveLayer — this cycle's inactive layer is still expected
+    //   3. prebufferedLayerRef === null         — onCanPlay didn't already resolve it
+    setTimeout(() => {
+      if (
+        transitionStateRef.current === 'DISPLAYING' &&
+        expectedLayerRef.current === inactiveLayer &&
+        prebufferedLayerRef.current === null
+      ) {
+        prebufferedLayerRef.current = inactiveLayer;
+        expectedLayerRef.current = -1; // consistent with Case B — stop any late onCanPlay
+        logEvent(`prebuffer fallback [${inactiveLayer}] (onCanPlay did not fire)`);
+      }
+    }, 300);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const requestTransition = useCallback(() => {

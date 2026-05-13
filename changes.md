@@ -110,3 +110,38 @@ The mutex is reset to `false` in `startDisplayClock` before each new pre-buffer 
 - `handleLayerReady` Case B: `if (prebufferFrozenRef.current) return` added as primary guard; `prebufferFrozenRef.current = true` set immediately before `vr.play()`
 - `startDisplayClock`: `prebufferFrozenRef.current = false` reset before the pre-buffer block
 - 4 lines added total, 0 deleted, no structural changes
+
+---
+
+## 2026-05-12 — Addendum: Tizen `onCanPlay` reliability fallback
+
+**File:** `src/pages/AmbientViewerPage.jsx`
+
+### Problem
+On the physical Samsung TV, `onCanPlay` does not fire for videos mounted on a hidden (inactive) layer. All prior fixes assumed `onCanPlay` would eventually arrive. On-device result: `prebufferedLayerRef` stays `null`, `handleVideoEnd` falls through to `requestTransition` (slow path), enters `LOADING_NEXT`, then gets stuck permanently because `onCanPlay` never fires for the remounted element either.
+
+On-device log showing the stuck state:
+```
+State: LOADING_NEXT
+Active Layer: 0
+Pre-buffer: none
+L0: ambient-4-1778561794-0.mp4  ACTIVE
+L1: ambient-4-1778561804-0.mp4
+
+27.36s - onEnded [0]
+2.09s  - prebuffer mounted [1] ambient-4-1778561804-0.mp4
+2.08s  - startDisplayClock
+2.08s  - setActiveLayer → 0
+```
+
+### Root cause
+Samsung Tizen WebKit suppresses `onCanPlay` for `<video>` elements whose containing layer has `opacity: 0`. The pre-buffer video is always on the inactive (opacity 0) layer. `preload="auto"` still causes the browser to decode the video into its buffer regardless of `onCanPlay`.
+
+### Fix
+Added a 300ms fallback `setTimeout` at the end of `startDisplayClock`, after the pre-buffer mounting block. If `prebufferedLayerRef.current` is still `null` after 300ms, it is set to `inactiveLayer` — treating the video as pre-buffered based on decode time rather than `onCanPlay`. Three guards prevent a stale timeout from a previous cycle misfiring: state must still be `DISPLAYING`, `expectedLayerRef` must still equal this cycle's `inactiveLayer`, and `prebufferedLayerRef` must still be `null`.
+
+On desktop (where `onCanPlay` fires within milliseconds), the timeout fires after 300ms but the `prebufferedLayerRef.current === null` guard is already false — the fallback is a no-op.
+
+### Changes
+- 1 `setTimeout` block (14 lines) added at the end of `startDisplayClock`, before the closing `}, [])`.
+- No new refs, no new state, no deps changes, no structural changes.
