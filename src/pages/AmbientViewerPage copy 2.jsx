@@ -36,17 +36,6 @@ export function AmbientViewerPage() {
   // Acts as a synchronous mutex: some WebKit/Tizen builds fire onCanPlay re-entrantly
   // inside play() before JS yields, so expectedLayerRef = -1 alone is not sufficient.
   const prebufferFrozenRef = useRef(false);
-  // null | 0 | 1 — layer index of an outgoing video being held visible as backdrop
-  // during the incoming image's opacity fade-in. Excludes that layer from the
-  // off-screen translate rule below so the previous video stays underneath the
-  // fading image instead of disappearing to a black container background.
-  const outgoingHoldRef = useRef(null);
-  // Diagnostic: performance.now() at the moment of the most recent fast-path flip.
-  // Paired with firstFrameLayerRef so the next timeupdate on that layer logs the
-  // black-gap latency (flip → first painted frame). Photograph the overlay to read.
-  const flipAtRef = useRef(0);
-  const firstFrameLayerRef = useRef(-1);
-  const errorCountRef = useRef(0);
 
   const isDebug = searchParams.get('debug') === 'true';
   const [, setDebugTick] = useState(0);
@@ -155,66 +144,29 @@ export function AmbientViewerPage() {
     prebufferedLayerRef.current = null; // reset: new pre-buffer cycle starting
     prebufferFrozenRef.current = false; // reset mutex for new pre-buffer cycle
 
-    // If the inactive layer is currently the outgoing-hold backdrop (video→image
-    // case), mounting the new pre-buffer would unmount the held video and expose
-    // the black container background under the image fade-in. Defer the mount
-    // by CROSSFADE_DURATION so the hold expires first.
-    const mountDelay = outgoingHoldRef.current === inactiveLayer ? CROSSFADE_DURATION : 0;
+    setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
+    setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
+    logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
 
-    const mountPrebuffer = () => {
-      // Guards: state must still be DISPLAYING and the expected inactive layer
-      // must still be the one we computed — otherwise another transition fired
-      // in the deferred window and our setup is stale.
-      if (transitionStateRef.current !== 'DISPLAYING') return;
-      if (expectedLayerRef.current !== inactiveLayer) return;
-
-      setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
-      setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
-      logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
-
-      // Fallback for platforms (e.g. Tizen WebKit) where onCanPlay does not fire on
-      // off-screen (translated) layer videos. preload="auto" still triggers decode;
-      // after 300 ms, verify readyState before marking ready. If still not at
-      // HAVE_FUTURE_DATA, extend by 900 ms before giving up. Total budget ~1.2 s.
-      setTimeout(() => {
-        if (
-          transitionStateRef.current !== 'DISPLAYING' ||
-          expectedLayerRef.current !== inactiveLayer ||
-          prebufferedLayerRef.current !== null
-        ) return;
-
-        const v = videoRefs[inactiveLayer].current;
-        const nextItemNow = mediaRef.current[nextIndexRef.current];
-        const isVideo = nextItemNow?.media_type === 'video';
-        const ready = !isVideo || (v && v.readyState >= 3); // HAVE_FUTURE_DATA
-
-        if (ready) {
-          prebufferedLayerRef.current = inactiveLayer;
-          expectedLayerRef.current = -1;
-          logEvent(`prebuffer fallback [${inactiveLayer}] ready (rs=${v?.readyState ?? 'n/a'})`);
-          return;
-        }
-
-        logEvent(`prebuffer fallback [${inactiveLayer}] rs=${v?.readyState} — waiting`);
-        setTimeout(() => {
-          if (
-            transitionStateRef.current !== 'DISPLAYING' ||
-            expectedLayerRef.current !== inactiveLayer ||
-            prebufferedLayerRef.current !== null
-          ) return;
-          prebufferedLayerRef.current = inactiveLayer;
-          expectedLayerRef.current = -1;
-          const rsNow = videoRefs[inactiveLayer].current?.readyState ?? 'n/a';
-          logEvent(`prebuffer late-fallback [${inactiveLayer}] (rs=${rsNow})`);
-        }, 900);
-      }, 300);
-    };
-
-    if (mountDelay > 0) {
-      setTimeout(mountPrebuffer, mountDelay);
-    } else {
-      mountPrebuffer();
-    }
+    // Fallback for platforms (e.g. Tizen WebKit) where onCanPlay does not fire on hidden
+    // (inactive) layer videos. preload="auto" still causes decode; after 300ms treat the
+    // layer as pre-buffered even without onCanPlay confirmation.
+    // inactiveLayer is a local const — each call captures its own value in the closure.
+    // Three guards prevent a stale timeout from a previous cycle misfiring:
+    //   1. transitionStateRef === 'DISPLAYING'  — state hasn't changed
+    //   2. expectedLayerRef   === inactiveLayer — this cycle's inactive layer is still expected
+    //   3. prebufferedLayerRef === null         — onCanPlay didn't already resolve it
+    setTimeout(() => {
+      if (
+        transitionStateRef.current === 'DISPLAYING' &&
+        expectedLayerRef.current === inactiveLayer &&
+        prebufferedLayerRef.current === null
+      ) {
+        prebufferedLayerRef.current = inactiveLayer;
+        expectedLayerRef.current = -1; // consistent with Case B — stop any late onCanPlay
+        logEvent(`prebuffer fallback [${inactiveLayer}] (onCanPlay did not fire)`);
+      }
+    }, 300);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const requestTransition = useCallback(() => {
@@ -224,28 +176,18 @@ export function AmbientViewerPage() {
 
     if (applyPendingIfNeeded()) { prebufferedLayerRef.current = null; return; }
 
-    // Fast path: next item is already pre-buffered — flip instantly.
-    // Covers image→video and image→image transitions (image timer fires here);
-    // video→{anything} fast-path lives in handleVideoEnd. No outgoing-hold needed
-    // here because the active layer (image) is on top with zIndex 2 covering the
-    // fading-out item underneath.
+    // Fast path: next video is already pre-buffered at frame 0 — flip instantly.
+    // Covers image→video transitions (including playlist loop reset) where requestTransition
+    // is the caller rather than handleVideoEnd.
     if (prebufferedLayerRef.current !== null) {
       const readyLayer = prebufferedLayerRef.current;
-
-      if (nextIndexRef.current === 0 && currentIdxRef.current !== 0) {
-        logEvent('=== LOOP RESTART ===');
-      }
-
       currentIdxRef.current = nextIndexRef.current;
       activeLayerRef.current = readyLayer;
       prebufferedLayerRef.current = null;
       transitionStateRef.current = 'DISPLAYING';
-      const item = mediaRef.current[currentIdxRef.current];
-      flipAtRef.current = performance.now();
-      firstFrameLayerRef.current = item?.media_type === 'video' ? readyLayer : -1;
       setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
-      const flipRs = videoRefs[readyLayer].current?.readyState ?? 'n/a';
-      logEvent(`setActiveLayer → ${readyLayer} (fast path, rs=${flipRs})`);
+      logEvent(`setActiveLayer → ${readyLayer} (pre-buffer fast path)`);
+      const item = mediaRef.current[currentIdxRef.current];
       startDisplayClock(item);
       return;
     }
@@ -274,14 +216,18 @@ export function AmbientViewerPage() {
       // WebKit/Tizen builds before JS yields back to the event loop.
       if (prebufferFrozenRef.current) return;
       const item = mediaRef.current[nextIndexRef.current];
-      logEvent(`prebuffer ready via onCanPlay [${layerIdx}] — ${item?.file_path?.split('/').pop()}`);
-      // Note: previously we ran a play()→pause()→currentTime=0 "freeze" here to
-      // guarantee frame 0 at flip. With the off-screen translate (renderLayer
-      // offscreen rule), Tizen decodes the inactive video naturally and it sits
-      // at currentTime=0 since play() was never called. The autoplay useEffect
-      // calls play() at flip. Keeping prebufferFrozenRef and expectedLayerRef=-1
-      // as safety belts against any residual onCanPlay re-fires.
-      prebufferFrozenRef.current = true;
+      logEvent(`onCanPlay/onLoad [${layerIdx}] — ${item?.file_path?.split('/').pop()}`);
+      if (item?.media_type === 'video') {
+        const vr = videoRefs[layerIdx].current;
+        if (vr) {
+          prebufferFrozenRef.current = true; // set before play() — blocks re-entrant onCanPlay
+          vr.play().catch(() => {}); // fire-and-forget
+          vr.pause();                // synchronous cancel — freeze in same microtask
+          vr.currentTime = 0;
+          logEvent(`play() called [${layerIdx}]`);
+          logEvent(`pause() called [${layerIdx}] (pre-buffer freeze)`);
+        }
+      }
       prebufferedLayerRef.current = layerIdx;
       // Secondary guard: blocks async onCanPlay re-fires (future event-loop ticks).
       expectedLayerRef.current = -1;
@@ -294,14 +240,11 @@ export function AmbientViewerPage() {
 
     transitionStateRef.current = 'FADING';
     activeLayerRef.current = layerIdx;
+    setActiveLayer(layerIdx);
     currentIdxRef.current = nextIndexRef.current;
 
     const nextItem = mediaRef.current[currentIdxRef.current];
-    flipAtRef.current = performance.now();
-    firstFrameLayerRef.current = nextItem?.media_type === 'video' ? layerIdx : -1;
-    setActiveLayer(layerIdx);
-    const flipRs = videoRefs[layerIdx].current?.readyState ?? 'n/a';
-    logEvent(`setActiveLayer → ${layerIdx} (slow path, rs=${flipRs})`);
+    logEvent(`setActiveLayer → ${layerIdx}`);
 
     if (nextItem?.media_type !== 'image') {
       // Video: enter DISPLAYING immediately and kick off the pre-buffer cycle
@@ -320,38 +263,14 @@ export function AmbientViewerPage() {
     if (prebufferedLayerRef.current !== null) {
       // Fast path: pre-buffered video is frozen at frame 0 — instant flip
       const readyLayer = prebufferedLayerRef.current;
-      const departingLayer = activeLayerRef.current;
-      const nextItem = mediaRef.current[nextIndexRef.current];
-
-      if (nextIndexRef.current === 0 && currentIdxRef.current !== 0) {
-        logEvent('=== LOOP RESTART ===');
-      }
-
-      // Video → Image: hold the outgoing video as backdrop so the image's
-      // 500 ms opacity fade-in is composited over the previous frame instead
-      // of the black container background. Cleared after CROSSFADE_DURATION,
-      // guarded against rapid re-transitions overwriting outgoingHoldRef.
-      if (nextItem?.media_type === 'image') {
-        outgoingHoldRef.current = departingLayer;
-        logEvent(`outgoingHold start [${departingLayer}]`);
-        setTimeout(() => {
-          if (outgoingHoldRef.current === departingLayer) {
-            outgoingHoldRef.current = null;
-            logEvent(`outgoingHold end [${departingLayer}]`);
-          }
-        }, CROSSFADE_DURATION);
-      }
-
       currentIdxRef.current = nextIndexRef.current;
       activeLayerRef.current = readyLayer;
       prebufferedLayerRef.current = null;
       transitionStateRef.current = 'DISPLAYING';
-      flipAtRef.current = performance.now();
-      firstFrameLayerRef.current = nextItem?.media_type === 'video' ? readyLayer : -1;
       setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
-      const flipRs = videoRefs[readyLayer].current?.readyState ?? 'n/a';
-      logEvent(`setActiveLayer → ${readyLayer} (fast path, rs=${flipRs})`);
-      startDisplayClock(nextItem); // immediately pre-buffer the item after this one
+      logEvent(`setActiveLayer → ${readyLayer} (pre-buffer fast path)`);
+      const item = mediaRef.current[currentIdxRef.current];
+      startDisplayClock(item); // immediately pre-buffer the item after this one
       return;
     }
 
@@ -368,15 +287,10 @@ export function AmbientViewerPage() {
       const ref = videoRefs[activeLayer];
       if (ref.current) {
         ref.current.currentTime = 0;
-        const p = ref.current.play();
-        // Some very old WebKit builds return undefined from play(); guard the chain.
-        if (p && typeof p.then === 'function') {
-          p.then(() => logEvent(`play() resolved [${activeLayer}]`))
-           .catch((e) => logEvent(`play() rejected [${activeLayer}]: ${e?.name ?? 'Error'}`));
-        }
+        ref.current.play().catch(() => {});
       }
     }
-  }, [activeLayer, layerMedia, media, logEvent]);
+  }, [activeLayer, layerMedia, media]);
 
   /* ---------------- PUBLISH ---------------- */
 
@@ -433,23 +347,6 @@ export function AmbientViewerPage() {
     );
   }
 
-  const handleTimeUpdate = (layerIdx) => {
-    if (firstFrameLayerRef.current !== layerIdx) return;
-    const v = videoRefs[layerIdx].current;
-    if (!v || v.currentTime <= 0) return;
-    const delta = Math.round(performance.now() - flipAtRef.current);
-    logEvent(`flip → first-frame [${layerIdx}]: ${delta}ms`);
-    firstFrameLayerRef.current = -1;
-  };
-
-  const handleMediaError = (layerIdx, item) => {
-    errorCountRef.current += 1;
-    const filename = item?.file_path?.split('/').pop() ?? '?';
-    const v = videoRefs[layerIdx].current;
-    const code = v?.error?.code ?? '';
-    logEvent(`onError [${layerIdx}] ${filename}${code ? ` code=${code}` : ''}`);
-  };
-
   const renderLayer = (layerIdx) => {
     const mediaIdx = layerMedia[layerIdx];
     if (mediaIdx === null || mediaIdx === undefined) return null;
@@ -458,22 +355,13 @@ export function AmbientViewerPage() {
     const src = item.file_path;
     const isActive = activeLayer === layerIdx;
 
-    const isVideo = item.media_type === 'video';
-    // Tizen WebKit suppresses video decode on opacity:0 layers. Keep inactive
-    // video at opacity 1 and instead translate it offscreen so it is composited
-    // (and therefore decoded) without being visible. Images still crossfade via
-    // opacity. The outgoingHoldRef exception keeps a just-departed video on-screen
-    // underneath an incoming image during the 500 ms opacity fade-in.
-    const offscreen = isVideo && !isActive && outgoingHoldRef.current !== layerIdx;
-
     return (
       <div
         key={layerIdx}
         style={{
           position: 'absolute',
           inset: 0,
-          opacity: isVideo ? 1 : (isActive ? 1 : 0),
-          transform: offscreen ? 'translateX(-200vw)' : 'none',
+          opacity: isActive ? 1 : 0,
           transition: item.media_type === 'image' ? `opacity ${CROSSFADE_DURATION}ms ease` : 'none',
           zIndex: isActive ? 2 : 1,
         }}
@@ -488,8 +376,6 @@ export function AmbientViewerPage() {
             preload="auto"
             onCanPlay={() => handleLayerReady(layerIdx)}
             onEnded={isActive ? handleVideoEnd : undefined}
-            onTimeUpdate={() => handleTimeUpdate(layerIdx)}
-            onError={() => handleMediaError(layerIdx, item)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
           />
         ) : (
@@ -498,7 +384,6 @@ export function AmbientViewerPage() {
             src={src}
             alt=""
             onLoad={() => handleLayerReady(layerIdx)}
-            onError={() => handleMediaError(layerIdx, item)}
             style={{ width: '100%', height: '100%', objectFit: 'cover' }}
           />
         )}
@@ -538,8 +423,6 @@ export function AmbientViewerPage() {
             <div>State: <b>{transitionStateRef.current}</b></div>
             <div>Active Layer: <b>{activeLayerRef.current}</b></div>
             <div>Pre-buffer: <b>{prebufferedLayerRef.current ?? 'none'}</b></div>
-            <div>OutgoingHold: <b>{outgoingHoldRef.current ?? 'none'}</b></div>
-            <div>Errors: <b style={{ color: errorCountRef.current > 0 ? '#f66' : '#0f0' }}>{errorCountRef.current}</b></div>
             {[0, 1].map(li => {
               const mIdx = layerMedia[li];
               const fname = mIdx != null ? (mediaRef.current[mIdx]?.file_path?.split('/').pop() ?? '?') : '—';

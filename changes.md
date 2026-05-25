@@ -145,3 +145,98 @@ On desktop (where `onCanPlay` fires within milliseconds), the timeout fires afte
 ### Changes
 - 1 `setTimeout` block (14 lines) added at the end of `startDisplayClock`, before the closing `}, [])`.
 - No new refs, no new state, no deps changes, no structural changes.
+
+---
+
+## 2026-05-18 — Per-Transition Decode + Backdrop + Diagnostic Overlay
+
+**Files:** `src/pages/AmbientViewerPage.jsx`, `vite.config.js`
+
+**Symptom on Tizen TV (10.1.1.332:3200):** Black flashes / stutter at every transition, despite the prior pre-buffer architecture. The user can only photograph the `?debug=true` overlay — no live console. Plays end-to-end so JS parses and media loads; the problem is the flip itself.
+
+**Working hypothesis:** The 300 ms `onCanPlay`-suppression fallback (prior session) marks the pre-buffered layer "ready" by elapsed time alone — but Tizen WebKit suppresses video decode on `opacity: 0` layers entirely, so when the flip happens the new active video has nothing decoded yet and `play()` triggers a fresh decode → 200-700 ms of black before first frame paints.
+
+Seven coordinated changes plus a build-target tightening.
+
+### Change 1 — `renderLayer` opacity/transform rules (video composited off-screen, image still crossfades)
+
+Previously the inactive layer was hidden via `opacity: 0` for both image and video. Tizen suppresses decode on opacity-zero video. Replaced with a media-type-aware rule:
+
+- Image: keep `opacity: isActive ? 1 : 0` and the 500 ms opacity transition. Crossfade is unchanged.
+- Video: `opacity: 1` always; the inactive video is moved off-screen via `transform: translateX(-200vw)` so it is composited (and therefore decoded) without being visible. Active video sits at `transform: none`.
+
+A new `offscreen` boolean captures the rule: `isVideo && !isActive && outgoingHoldRef.current !== layerIdx`. The `outgoingHoldRef` exception is what Change 5 uses to keep a just-departed video on-screen as a backdrop for an incoming image's fade.
+
+Refs block at top of component gains `outgoingHoldRef = useRef(null)`.
+
+### Change 2 — Drop the `play() → pause() → currentTime = 0` freeze in `handleLayerReady` Case B
+
+The synchronous freeze sequence had to exist only because the inactive video was on an `opacity: 0` layer and the team wanted to guarantee frame 0 at flip. With Change 1, Tizen actually decodes the off-screen layer and the video sits naturally at `currentTime = 0` since `play()` was never called. Removed the `vr.play().catch() / vr.pause() / vr.currentTime = 0` lines. `prebufferFrozenRef = true` and `expectedLayerRef = -1` are kept as safety belts against residual `onCanPlay` re-fires.
+
+Event log message changed from `onCanPlay/onLoad [N]` to `prebuffer ready via onCanPlay [N] — <filename>` for differentiation against the fallback path.
+
+### Change 3 — `?debug=true` overlay instrumentation
+
+The user can photograph the overlay. Every diagnostic that doesn't make it into the photo is wasted. Added:
+
+- **`flipAtRef` + `firstFrameLayerRef`** refs. At every fast-path flip and at slow-path Case A, record `performance.now()` and the layer to watch. New `handleTimeUpdate(layerIdx)` on the `<video>` element fires on the next `timeupdate`, computes `performance.now() - flipAtRef.current`, logs `flip → first-frame [N]: <Nms>`, and disarms (`firstFrameLayerRef = -1`). Other layers' timeupdates are filtered out by the guard. This is the single number that says whether decode-ahead actually worked.
+- **`onError` on `<video>` and `<img>`.** New `handleMediaError(layerIdx, item)` increments `errorCountRef`, captures `videoElement.error.code` when present, logs `onError [N] <filename> code=N`. Overlay header shows `Errors: N` in red when > 0.
+- **`play()` outcome logging.** The autoplay `useEffect` previously did `.play().catch(() => {})` — silently swallowing `NotAllowedError`. Now: capture the returned promise, feature-detect (`typeof p.then === 'function'` for very old WebKit that returns undefined), then `.then` logs `play() resolved [N]` and `.catch` logs `play() rejected [N]: <ErrorName>`. A photograph of `NotAllowedError` would mean Tizen's autoplay policy is blocking and unblock the next round of work.
+- **`flipRs` at every flip.** Read `videoRefs[readyLayer].current.readyState` immediately after `setActiveLayer(readyLayer)` and append it to the log line, e.g. `setActiveLayer → 1 (fast path, rs=4)`. `rs=4` (HAVE_ENOUGH_DATA) or `rs=3` is healthy; `rs<3` means decode-ahead failed.
+- **Pre-buffer resolution differentiation.** Case B logs `prebuffer ready via onCanPlay [N]`. The fallback logs `prebuffer fallback [N] ready (rs=N)` (or `prebuffer late-fallback [N]` for the 1.2 s budget end). The distribution of these tells us whether `onCanPlay` even fires on Tizen now that the layer is translated rather than transparent.
+- **`OutgoingHold: <layer|none>`** in the overlay header so a photograph during a video→image fade shows which layer is the held backdrop.
+
+### Change 4 — `vite.config.js` build target
+
+Added `build: { target: 'es2018' }` inside `defineConfig`. Tizen version on the target TV is unknown; pre-2020 Tizen Chromium (≤ 76) does not parse optional chaining or nullish coalescing. Vite 5's default `'modules'` ships those unchanged. ES2018 transpiles them down without losing useful syntax.
+
+### Change 5 — Outgoing-video backdrop hold for Video → Image transitions
+
+Without this, every video→image transition shows a 500 ms fade from **black** (the container background) to the image because Change 1's off-screen translate moves the just-departed video out of view the moment it becomes inactive.
+
+- New `outgoingHoldRef = useRef(null)` — `null | 0 | 1`, layer index of an outgoing video being kept on-screen.
+- In `handleVideoEnd`'s fast path, *before* `setActiveLayer`, capture `departingLayer = activeLayerRef.current` and the `nextItem`. If `nextItem.media_type === 'image'`: set `outgoingHoldRef.current = departingLayer`, log `outgoingHold start [N]`, schedule a clear at `CROSSFADE_DURATION`. The clear is guarded — only nulls the ref if it still equals `departingLayer` — so a rapid second transition can't have its hold overwritten.
+- The `renderLayer` `offscreen` rule (Change 1) consults `outgoingHoldRef.current !== layerIdx`, so the held video stays at `transform: none`, opacity 1, zIndex 1. The incoming image fades in over the top (zIndex 2, opacity 0 → 1). Net visual: smooth crossfade from video's last frame to the image.
+- In `startDisplayClock`, the new pre-buffer mount on the inactive layer would otherwise unmount the held video immediately (via `setLayerSeq[inactiveLayer] += 1`). Added `mountDelay = outgoingHoldRef.current === inactiveLayer ? CROSSFADE_DURATION : 0`. The mount + the readiness-check `setTimeout` block are wrapped in `mountPrebuffer()` and called via `setTimeout(mountPrebuffer, mountDelay)`. Stale-cycle guards re-check state and `expectedLayerRef` before mounting.
+
+### Change 6 — Pre-buffer readiness check + late-fallback (replaces unconditional 300 ms fallback)
+
+The prior 300 ms fallback marked the inactive video pre-buffered regardless of actual `readyState`. Replaced with:
+
+- At 300 ms, read `videoElement.readyState`. If `>= 3` (HAVE_FUTURE_DATA) — or if next item is image — mark ready: `prebuffer fallback [N] ready (rs=N)`.
+- Else log `prebuffer fallback [N] rs=N — waiting` and schedule a `+900 ms` retry (total budget ~1.2 s).
+- At 1.2 s, mark ready regardless and log `prebuffer late-fallback [N] (rs=N)`. A small gap is better than missing the flip entirely.
+
+This is gated by `transitionStateRef === 'DISPLAYING'` and `expectedLayerRef === inactiveLayer` at both points, so a stale timeout from a previous cycle can't misfire after a real transition has moved on.
+
+### Change 7 — Loop-boundary marker
+
+The pre-buffer for item 0 is mounted during item N-1's `DISPLAYING` phase via the `% length` wraparound — so loop boundaries reuse the same code paths as Cases 1-3 with the full duration of item N-1 as decode time. No code is needed beyond a diagnostic marker.
+
+At both fast-path flip sites (in `handleVideoEnd` and in `requestTransition`'s fast path), added one line before the `currentIdxRef.current = nextIndexRef.current` update:
+```js
+if (nextIndexRef.current === 0 && currentIdxRef.current !== 0) {
+  logEvent('=== LOOP RESTART ===');
+}
+```
+A photograph of the overlay will show the marker between transition rows so we can spot whether glitches cluster at the boundary.
+
+### Verification plan
+
+Deploy to `http://10.1.1.332:3200/<branchId>/2/<displayId>?debug=true` with a playlist of `[video, image, video, image]` (exercises Video→Image, Image→Video, Video→Video with short videos, and the loop boundary). Photograph the overlay during 3 full loops.
+
+Healthy signal in the photo:
+- Every `setActiveLayer → N (fast path, rs=N)` has `rs=3` or `rs=4`.
+- `flip → first-frame [N]: <Nms>` rows are under 50 ms for video transitions.
+- `prebuffer ready via onCanPlay [N]` dominates; `prebuffer fallback ... ready` is occasional; `prebuffer late-fallback` never appears.
+- `outgoingHold start [N]` and `outgoingHold end [N]` appear in pairs around every video→image transition.
+- `=== LOOP RESTART ===` appears at the expected place.
+- `Errors: 0`.
+- No `play() rejected: NotAllowedError`.
+
+If `rs=2` recurs at flips, Tizen suppresses decode on translated layers too — escalation Change 8 (separate hidden warm-up `<video>` with `readyState` polling, **not** `requestVideoFrameCallback` which is Chromium-only and absent on Tizen WebKit) becomes the next step. Not in this PR.
+
+### Constants & invariants
+
+- All new code references `CROSSFADE_DURATION` (the existing single constant) rather than the literal `500`. The 300 ms / 900 ms in the readiness fallback are intentionally distinct values and remain inline.
+- No new dependencies, no state machine restructuring, no backend changes.

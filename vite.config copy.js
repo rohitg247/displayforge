@@ -4,12 +4,6 @@ import path from "path";
 import { componentTagger } from "lovable-tagger";
 
 export default defineConfig(({ mode }) => ({
-  build: {
-    // Tizen TV WebKit on pre-2020 firmware (Chromium <= 76) cannot parse
-    // optional chaining (?.) or nullish coalescing (??). Vite 5's default
-    // 'modules' target ships those unchanged. Transpile down to ES2018.
-    target: 'es2018',
-  },
   server: {
     host: "::",
     port: 8080,
