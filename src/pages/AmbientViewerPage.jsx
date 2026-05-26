@@ -5,79 +5,216 @@ import { toast } from '@/components/ui/sonner';
 
 const IMAGE_DURATION = 5000;
 const CROSSFADE_DURATION = 500;
+const BRIDGE_FADE_DURATION = 150;
+const SWAP_TIMEOUT_MS = 2000;
 const POLL_INTERVAL = 5000;
+const DECODE_SLOW_THRESHOLD_MS = 800;
+const FRAME_STUCK_WARN_MS = 500;
+const FRAME_STUCK_FATAL_MS = 1500;
+const LOG_RING_SIZE = 30;
+const DEBUG_TICK_MS = 200;
+
+// D2 contingency knob. Only flip to true after on-device evidence that the
+// onended-time frame is consistently unpaintable on a given Tizen firmware.
+const EARLY_BRIDGE_CAPTURE = false;
+const EARLY_BRIDGE_LEAD_MS = 250;
+
+const STATE_IDLE = 'IDLE';
+const STATE_PLAYING = 'PLAYING';
+const STATE_SWAPPING = 'SWAPPING';
+
+const COLOR_BY_CLASS = {
+  lifecycle: '#9cf',
+  success: '#7f7',
+  warn: '#ff7',
+  error: '#f77',
+  state: '#fc7',
+  verbose: '#ccc',
+};
+
+const basename = (p) => (p ? p.split('/').pop() : '');
 
 export function AmbientViewerPage() {
   const { id } = useParams();
   const [searchParams] = useSearchParams();
   const isPreview = searchParams.get('preview') === 'true';
   const previewPlaylist = searchParams.get('playlist') || 'A';
+  const debugMode = searchParams.get('debug');
+  const isDebug = debugMode === 'true' || debugMode === 'verbose';
+  const isVerbose = debugMode === 'verbose';
 
   const [display, setDisplay] = useState(null);
   const [media, setMedia] = useState([]);
-  const [activeLayer, setActiveLayer] = useState(0);
-  const [layerMedia, setLayerMedia] = useState([null, null]);
-  const [layerSeq, setLayerSeq] = useState([0, 0]);
   const [publishing, setPublishing] = useState(false);
-
-  const mediaRef = useRef([]);
-  const currentIdxRef = useRef(0);
-  const nextIndexRef = useRef(null);
-  const timerRef = useRef(null);
-  const transitionStateRef = useRef('INIT');
-  const initializedRef = useRef(false);
-  const pendingDataRef = useRef(null);
-  const activeLayerRef = useRef(0);   // always-current mirror of activeLayer state
-  const expectedLayerRef = useRef(0); // which layer index we're waiting to fire onCanPlay/onLoad
-  const videoRefs = [useRef(null), useRef(null)];
-  const prebufferedLayerRef = useRef(null); // null | 0 | 1 — layer with video frozen at frame 0
-  const eventLogRef = useRef([]);           // rolling debug event log (last 15 entries)
-  // True while the freeze sequence (play→pause→currentTime=0) is executing.
-  // Acts as a synchronous mutex: some WebKit/Tizen builds fire onCanPlay re-entrantly
-  // inside play() before JS yields, so expectedLayerRef = -1 alone is not sufficient.
-  const prebufferFrozenRef = useRef(false);
-  // null | 0 | 1 — layer index of an outgoing video being held visible as backdrop
-  // during the incoming image's opacity fade-in. Excludes that layer from the
-  // off-screen translate rule below so the previous video stays underneath the
-  // fading image instead of disappearing to a black container background.
-  const outgoingHoldRef = useRef(null);
-  // Diagnostic: performance.now() at the moment of the most recent fast-path flip.
-  // Paired with firstFrameLayerRef so the next timeupdate on that layer logs the
-  // black-gap latency (flip → first painted frame). Photograph the overlay to read.
-  const flipAtRef = useRef(0);
-  const firstFrameLayerRef = useRef(-1);
-  const errorCountRef = useRef(0);
-
-  const isDebug = searchParams.get('debug') === 'true';
   const [, setDebugTick] = useState(0);
 
-  const logEvent = useCallback((label) => {
-    const ts = (performance.now() / 1000).toFixed(2);
-    eventLogRef.current = [`${ts}s — ${label}`, ...eventLogRef.current].slice(0, 15);
+  // KEEP refs (from previous implementation, semantics unchanged)
+  const mediaRef = useRef([]);
+  const currentIdxRef = useRef(0);
+  const pendingDataRef = useRef(null);
+  const initializedRef = useRef(false);
+  const imageTimerRef = useRef(null);
+
+  // DOM refs
+  const videoRef = useRef(null);
+  const imageARef = useRef(null);
+  const imageBRef = useRef(null);
+  const bridgeCanvasRef = useRef(null);
+  const bridgeCtxRef = useRef(null);
+
+  // Engine state
+  const stateRef = useRef(STATE_IDLE);
+  const currentItemTypeRef = useRef(null);
+  const activeImageRef = useRef('A');
+  const swapTokenRef = useRef(0);
+  const prefetchRef = useRef(new Map());
+  const swapDeadlineRef = useRef(null);
+  const rafRef = useRef(null);
+  const earlyBridgeArmedRef = useRef(false);
+
+  // Watchdog / timing
+  const lastCtRef = useRef(0);
+  const lastCtAtRef = useRef(0);
+  const swapStartAtRef = useRef(0);
+  const lastSwapMsRef = useRef(0);
+  const playStartAtRef = useRef(0);
+  const mountStartRef = useRef(performance.now());
+
+  // Diagnostics
+  const eventLogRef = useRef([]);
+  const fpsFramesRef = useRef([]);
+  const fpsRateRef = useRef(0);
+  const prevRsRef = useRef(-1);
+  const prevNsRef = useRef(-1);
+  const errorCountRef = useRef(0);
+  const prefetchNameRef = useRef('—');
+  const prefetchStatusRef = useRef('idle');
+
+  /* ----------------------- LOGGING & TIMESTAMP HELPERS ---------------------- */
+
+  const fmtTimestamp = useCallback((now) => {
+    const elapsed = Math.max(0, now - mountStartRef.current);
+    const total = Math.floor(elapsed);
+    const m = Math.floor(total / 60000);
+    const s = Math.floor((total % 60000) / 1000);
+    const ms = total % 1000;
+    return `${String(m).padStart(2, '0')}:${String(s).padStart(2, '0')}.${String(ms).padStart(3, '0')}`;
   }, []);
 
-  /* ---------------- FETCH ---------------- */
+  const logEvent = useCallback((klass, msg) => {
+    const ts = fmtTimestamp(performance.now());
+    eventLogRef.current = [{ ts, klass, msg }, ...eventLogRef.current].slice(0, LOG_RING_SIZE);
+  }, [fmtTimestamp]);
+
+  const goState = useCallback((next) => {
+    const prev = stateRef.current;
+    if (prev === next) return;
+    stateRef.current = next;
+    logEvent('state', `state: ${prev} → ${next}`);
+  }, [logEvent]);
+
+  const bumpToken = useCallback(() => {
+    swapTokenRef.current += 1;
+    return swapTokenRef.current;
+  }, []);
+
+  const tokenValid = useCallback((t) => swapTokenRef.current === t, []);
+
+  const checkRsNsDelta = useCallback(() => {
+    const v = videoRef.current;
+    if (!v) return;
+    if (v.readyState !== prevRsRef.current) {
+      if (prevRsRef.current >= 0) logEvent('verbose', `rs: ${prevRsRef.current}→${v.readyState}`);
+      prevRsRef.current = v.readyState;
+    }
+    if (v.networkState !== prevNsRef.current) {
+      if (prevNsRef.current >= 0) logEvent('verbose', `ns: ${prevNsRef.current}→${v.networkState}`);
+      prevNsRef.current = v.networkState;
+    }
+  }, [logEvent]);
+
+  /* ----------------------------- BRIDGE HELPERS ----------------------------- */
+
+  const captureBridge = useCallback(() => {
+    const canvas = bridgeCanvasRef.current;
+    const v = videoRef.current;
+    if (!canvas || !v) {
+      logEvent('warn', 'bridge-capture-failed: missing refs');
+      return false;
+    }
+    if (!bridgeCtxRef.current) bridgeCtxRef.current = canvas.getContext('2d');
+    const ctx = bridgeCtxRef.current;
+    if (!ctx) {
+      logEvent('warn', 'bridge-capture-failed: no 2d context');
+      return false;
+    }
+    const w = v.videoWidth || v.clientWidth || 0;
+    const h = v.videoHeight || v.clientHeight || 0;
+    if (w <= 0 || h <= 0) {
+      logEvent('warn', 'bridge-capture-failed: zero dims');
+      return false;
+    }
+    if (canvas.width !== w) canvas.width = w;
+    if (canvas.height !== h) canvas.height = h;
+    try {
+      ctx.drawImage(v, 0, 0, w, h);
+      logEvent('state', `bridge on (${w}x${h})`);
+      return true;
+    } catch (err) {
+      logEvent('warn', `bridge-capture-failed: ${err?.name ?? 'Error'}`);
+      return false;
+    }
+  }, [logEvent]);
+
+  const setBridgeOpacity = useCallback((value, transitionMs) => {
+    const el = bridgeCanvasRef.current;
+    if (!el) return;
+    if (transitionMs > 0) {
+      el.style.transition = `opacity ${transitionMs}ms linear`;
+    } else {
+      el.style.transition = 'none';
+    }
+    el.style.opacity = String(value);
+  }, []);
+
+  /* -------------------------------- PREFETCH -------------------------------- */
+
+  const startPrefetch = useCallback((item) => {
+    if (!item) return;
+    const url = item.file_path;
+    if (prefetchRef.current.has(url)) return;
+    prefetchNameRef.current = basename(url);
+    prefetchStatusRef.current = 'loading';
+    logEvent('lifecycle', `prefetch start ${basename(url)}`);
+    const t0 = performance.now();
+    const promise = fetch(url, { cache: 'force-cache' })
+      .then((r) => r.blob())
+      .then((blob) => {
+        const elapsed = Math.round(performance.now() - t0);
+        const kb = Math.round(blob.size / 1024);
+        prefetchStatusRef.current = 'cached';
+        logEvent('success', `prefetch ok (${elapsed}ms, ${kb}kB)`);
+        return blob;
+      })
+      .catch((err) => {
+        prefetchStatusRef.current = 'fail';
+        logEvent('warn', `prefetch fail ${err?.message ?? err}`);
+      });
+    prefetchRef.current.set(url, promise);
+  }, [logEvent]);
+
+  /* ----------------------------- FETCH (POLLING) ---------------------------- */
 
   const fetchData = useCallback(async () => {
     try {
       const data = await api.getAmbientDisplay(Number(id), null, isPreview);
       const playlistToUse = isPreview ? previewPlaylist : (data.active_playlist || 'A');
-      const filteredMedia = (data.media || []).filter(m => m.playlist === playlistToUse);
-
+      const filteredMedia = (data.media || []).filter((m) => m.playlist === playlistToUse);
       if (!initializedRef.current) {
         setDisplay(data);
         setMedia(filteredMedia);
         mediaRef.current = filteredMedia;
-
-        if (filteredMedia.length > 0) {
-          currentIdxRef.current = 0;
-          nextIndexRef.current = 0;
-          expectedLayerRef.current = 0;
-          transitionStateRef.current = 'LOADING_NEXT';
-          setLayerMedia([0, null]);
-          setLayerSeq(prev => [prev[0] + 1, prev[1]]);
-        }
-
+        currentIdxRef.current = 0;
         initializedRef.current = true;
       } else {
         pendingDataRef.current = { display: data, media: filteredMedia };
@@ -89,296 +226,563 @@ export function AmbientViewerPage() {
 
   useEffect(() => {
     fetchData();
-    const interval = setInterval(fetchData, POLL_INTERVAL);
-    return () => clearInterval(interval);
+    const handle = setInterval(fetchData, POLL_INTERVAL);
+    return () => clearInterval(handle);
   }, [fetchData]);
 
   useEffect(() => {
     if (!isDebug) return;
-    const id = setInterval(() => setDebugTick(t => t + 1), 200);
-    return () => clearInterval(id);
+    const handle = setInterval(() => setDebugTick((t) => t + 1), DEBUG_TICK_MS);
+    return () => clearInterval(handle);
   }, [isDebug]);
 
-  /* ---------------- PLAYBACK ENGINE ---------------- */
-
-  // No activeLayer in deps — all reactive values accessed via refs (stable callback).
   const applyPendingIfNeeded = useCallback(() => {
     const pending = pendingDataRef.current;
     if (!pending) return false;
-
-    const currentPaths = mediaRef.current.map(m => m.file_path).join(',');
-    const newPaths = pending.media.map(m => m.file_path).join(',');
-
+    const currentPaths = mediaRef.current.map((m) => m.file_path).join(',');
+    const newPaths = pending.media.map((m) => m.file_path).join(',');
     setDisplay(pending.display);
-
-    if (currentPaths !== newPaths) {
-      setMedia(pending.media);
-      mediaRef.current = pending.media;
-      currentIdxRef.current = 0;
-      nextIndexRef.current = 0;
-      prebufferedLayerRef.current = null;
-      transitionStateRef.current = 'LOADING_NEXT';
-
-      const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-      expectedLayerRef.current = inactiveLayer;
-
-      setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = 0; return next; });
-      setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
-
-      pendingDataRef.current = null;
-      return true;
-    }
-
     pendingDataRef.current = null;
-    return false;
-  }, []);
+    if (currentPaths === newPaths) return false;
+    logEvent('lifecycle', 'render: media-changed');
+    const oldPath = mediaRef.current[currentIdxRef.current]?.file_path;
+    setMedia(pending.media);
+    mediaRef.current = pending.media;
+    const stillIdx = pending.media.findIndex((m) => m.file_path === oldPath);
+    currentIdxRef.current = stillIdx >= 0 ? stillIdx : 0;
+    prefetchRef.current.clear();
+    return true;
+  }, [logEvent]);
 
-  // deps [] — requestTransition is captured via setTimeout closure (called after both are defined);
-  // setLayerMedia/setLayerSeq are stable React setters.
-  const startDisplayClock = useCallback((item) => {
-    if (!item) return;
-    transitionStateRef.current = 'DISPLAYING';
-    logEvent(`startDisplayClock — ${item.file_path?.split('/').pop()}`);
+  /* ----------------------------- FRAME-FRAME LOOP --------------------------- */
 
-    if (item.media_type === 'image') {
-      timerRef.current = setTimeout(() => { requestTransition(); }, IMAGE_DURATION);
+  const startFirstFrameLoop = useCallback((token, onSuccess) => {
+    const v = videoRef.current;
+    if (!v) return;
+    lastCtRef.current = v.currentTime;
+    lastCtAtRef.current = performance.now();
+    let increments = 0;
+    let warnedSlow = false;
+    let warnedStuck = false;
+    let triedReload = false;
+
+    const tick = () => {
+      if (!tokenValid(token)) return;
+      if (stateRef.current !== STATE_SWAPPING) return;
+      const vid = videoRef.current;
+      if (!vid) return;
+      const now = performance.now();
+      const ct = vid.currentTime;
+
+      // FPS rolling 2s window
+      fpsFramesRef.current.push(now);
+      fpsFramesRef.current = fpsFramesRef.current.filter((t) => now - t < 2000);
+      fpsRateRef.current = Math.round(fpsFramesRef.current.length / 2);
+
+      // Frame progression
+      if (ct !== lastCtRef.current) {
+        lastCtRef.current = ct;
+        lastCtAtRef.current = now;
+        if (isVerbose) logEvent('verbose', `verbose: ct=${ct.toFixed(3)}`);
+        if (ct > 0 && !vid.paused) {
+          increments += 1;
+          if (increments >= 2) {
+            const elapsed = Math.round(now - playStartAtRef.current);
+            logEvent('success', `first-frame ct=${ct.toFixed(2)} (${elapsed}ms after play)`);
+            onSuccess();
+            return;
+          }
+        }
+      }
+
+      // Decode-slow advisory
+      if (!warnedSlow && now - playStartAtRef.current > DECODE_SLOW_THRESHOLD_MS) {
+        logEvent('warn', `decode slow (${Math.round(now - playStartAtRef.current)}ms)`);
+        warnedSlow = true;
+      }
+
+      // Stuck-frame watchdog
+      if (!vid.paused && now - lastCtAtRef.current > FRAME_STUCK_WARN_MS) {
+        if (!warnedStuck) {
+          logEvent('warn', `frame-stuck rs=${vid.readyState} ns=${vid.networkState} ct=${ct.toFixed(2)}`);
+          warnedStuck = true;
+        }
+        if (!triedReload && now - lastCtAtRef.current > FRAME_STUCK_FATAL_MS) {
+          logEvent('error', 'frame-stuck-fatal — reloading');
+          triedReload = true;
+          try {
+            vid.load();
+            const p = vid.play();
+            if (p && typeof p.then === 'function') p.catch(() => {});
+          } catch (_) { /* swallow */ }
+        }
+      }
+
+      checkRsNsDelta();
+      rafRef.current = requestAnimationFrame(tick);
+    };
+    rafRef.current = requestAnimationFrame(tick);
+  }, [tokenValid, logEvent, checkRsNsDelta, isVerbose]);
+
+  /* --------------------------- SWAP COMPLETE / FAIL ------------------------- */
+
+  const finalizeSwap = useCallback((token, nextItem, nextIdx) => {
+    if (!tokenValid(token)) return;
+    currentIdxRef.current = nextIdx;
+    currentItemTypeRef.current = nextItem.media_type;
+    if (swapDeadlineRef.current) { clearTimeout(swapDeadlineRef.current); swapDeadlineRef.current = null; }
+    if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+    lastSwapMsRef.current = Math.round(performance.now() - swapStartAtRef.current);
+    earlyBridgeArmedRef.current = false;
+    goState(STATE_PLAYING);
+
+    if (applyPendingIfNeeded()) {
+      // Playlist changed under us — re-derive next behavior.
     }
 
-    // Pre-buffer next item on inactive layer immediately
-    const currentMedia = mediaRef.current;
-    if (currentMedia.length <= 1) return;
+    if (currentItemTypeRef.current === 'image' && mediaRef.current.length > 1) {
+      armImageTimer();
+    }
 
-    const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
-    nextIndexRef.current = nextIdx;
-    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-    expectedLayerRef.current = inactiveLayer;
-    prebufferedLayerRef.current = null; // reset: new pre-buffer cycle starting
-    prebufferFrozenRef.current = false; // reset mutex for new pre-buffer cycle
+    const nextNextIdx = mediaRef.current.length > 0
+      ? (currentIdxRef.current + 1) % mediaRef.current.length
+      : 0;
+    if (mediaRef.current.length > 1) {
+      startPrefetch(mediaRef.current[nextNextIdx]);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch]);
 
-    // If the inactive layer is currently the outgoing-hold backdrop (video→image
-    // case), mounting the new pre-buffer would unmount the held video and expose
-    // the black container background under the image fade-in. Defer the mount
-    // by CROSSFADE_DURATION so the hold expires first.
-    const mountDelay = outgoingHoldRef.current === inactiveLayer ? CROSSFADE_DURATION : 0;
+  /* ---------------------------- TRANSITION CASES ---------------------------- */
 
-    const mountPrebuffer = () => {
-      // Guards: state must still be DISPLAYING and the expected inactive layer
-      // must still be the one we computed — otherwise another transition fired
-      // in the deferred window and our setup is stale.
-      if (transitionStateRef.current !== 'DISPLAYING') return;
-      if (expectedLayerRef.current !== inactiveLayer) return;
+  const fadeOutBridge = useCallback((token, onDone) => {
+    const el = bridgeCanvasRef.current;
+    if (!el) { onDone(); return; }
+    setBridgeOpacity(0, BRIDGE_FADE_DURATION);
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      el.removeEventListener('transitionend', onEnd);
+      if (!tokenValid(token)) return;
+      el.style.transition = 'none';
+      const elapsed = Math.round(performance.now() - swapStartAtRef.current);
+      logEvent('state', `bridge off (${elapsed}ms after swap)`);
+      onDone();
+    };
+    const onEnd = () => finish();
+    el.addEventListener('transitionend', onEnd);
+    setTimeout(finish, BRIDGE_FADE_DURATION + 100);
+  }, [setBridgeOpacity, tokenValid, logEvent]);
 
-      setLayerMedia(prev => { const n = [...prev]; n[inactiveLayer] = nextIdx; return n; });
-      setLayerSeq(prev  => { const n = [...prev]; n[inactiveLayer] += 1;    return n; });
-      logEvent(`prebuffer mounted [${inactiveLayer}] — ${currentMedia[nextIdx]?.file_path?.split('/').pop()}`);
+  const runVideoToVideo = useCallback((nextItem, nextIdx) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const token = bumpToken();
+    swapStartAtRef.current = performance.now();
+    goState(STATE_SWAPPING);
 
-      // Fallback for platforms (e.g. Tizen WebKit) where onCanPlay does not fire on
-      // off-screen (translated) layer videos. preload="auto" still triggers decode;
-      // after 300 ms, verify readyState before marking ready. If still not at
-      // HAVE_FUTURE_DATA, extend by 900 ms before giving up. Total budget ~1.2 s.
-      setTimeout(() => {
-        if (
-          transitionStateRef.current !== 'DISPLAYING' ||
-          expectedLayerRef.current !== inactiveLayer ||
-          prebufferedLayerRef.current !== null
-        ) return;
+    captureBridge();
+    setBridgeOpacity(1, 0);
 
-        const v = videoRefs[inactiveLayer].current;
-        const nextItemNow = mediaRef.current[nextIndexRef.current];
-        const isVideo = nextItemNow?.media_type === 'video';
-        const ready = !isVideo || (v && v.readyState >= 3); // HAVE_FUTURE_DATA
+    const url = nextItem.file_path;
+    logEvent('lifecycle', `src-set ${basename(url)}`);
+    v.src = url;
+    v.load();
+    logEvent('lifecycle', 'load() called');
 
-        if (ready) {
-          prebufferedLayerRef.current = inactiveLayer;
-          expectedLayerRef.current = -1;
-          logEvent(`prebuffer fallback [${inactiveLayer}] ready (rs=${v?.readyState ?? 'n/a'})`);
-          return;
-        }
+    swapDeadlineRef.current = setTimeout(() => {
+      if (!tokenValid(token)) return;
+      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade`);
+      setBridgeOpacity(0, 0);
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      finalizeSwap(token, nextItem, nextIdx);
+    }, SWAP_TIMEOUT_MS);
 
-        logEvent(`prebuffer fallback [${inactiveLayer}] rs=${v?.readyState} — waiting`);
+    logEvent('lifecycle', 'play() requested');
+    playStartAtRef.current = performance.now();
+    const p = v.play();
+    if (p && typeof p.then === 'function') {
+      p.then(() => logEvent('success', 'play() resolved'))
+       .catch((e) => { errorCountRef.current += 1; logEvent('error', `play() rejected: ${e?.name ?? 'Error'}`); });
+    }
+
+    startFirstFrameLoop(token, () => {
+      if (swapDeadlineRef.current) { clearTimeout(swapDeadlineRef.current); swapDeadlineRef.current = null; }
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      logEvent('state', 'video fade start (bridge)');
+      fadeOutBridge(token, () => {
+        logEvent('state', 'video fade end (bridge)');
+        finalizeSwap(token, nextItem, nextIdx);
+      });
+    });
+  }, [bumpToken, goState, captureBridge, setBridgeOpacity, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop, fadeOutBridge]);
+
+  const runImageToImage = useCallback((nextItem, nextIdx) => {
+    const fromKey = activeImageRef.current;
+    const toKey = fromKey === 'A' ? 'B' : 'A';
+    const prevImg = fromKey === 'A' ? imageARef.current : imageBRef.current;
+    const nextImg = toKey === 'A' ? imageARef.current : imageBRef.current;
+    if (!prevImg || !nextImg) return;
+
+    const token = bumpToken();
+    swapStartAtRef.current = performance.now();
+    goState(STATE_SWAPPING);
+
+    logEvent('lifecycle', `image src-set ${basename(nextItem.file_path)} [next=${toKey}]`);
+    nextImg.style.transition = 'none';
+    nextImg.style.opacity = '0';
+    nextImg.src = nextItem.file_path;
+
+    const decodeStart = performance.now();
+    let armedSwap = false;
+
+    const beginCrossfade = () => {
+      if (!tokenValid(token)) return;
+      if (armedSwap) return;
+      armedSwap = true;
+      const elapsed = Math.round(performance.now() - decodeStart);
+      logEvent('success', `image decoded (${elapsed}ms)`);
+      requestAnimationFrame(() => {
+        if (!tokenValid(token)) return;
+        logEvent('state', `image fade start [${fromKey}→${toKey}]`);
+        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        nextImg.style.opacity = '1';
+        prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        prevImg.style.opacity = '0';
         setTimeout(() => {
-          if (
-            transitionStateRef.current !== 'DISPLAYING' ||
-            expectedLayerRef.current !== inactiveLayer ||
-            prebufferedLayerRef.current !== null
-          ) return;
-          prebufferedLayerRef.current = inactiveLayer;
-          expectedLayerRef.current = -1;
-          const rsNow = videoRefs[inactiveLayer].current?.readyState ?? 'n/a';
-          logEvent(`prebuffer late-fallback [${inactiveLayer}] (rs=${rsNow})`);
-        }, 900);
-      }, 300);
+          if (!tokenValid(token)) return;
+          logEvent('state', `image fade end [${fromKey}→${toKey}]`);
+          activeImageRef.current = toKey;
+          finalizeSwap(token, nextItem, nextIdx);
+        }, CROSSFADE_DURATION);
+      });
     };
 
-    if (mountDelay > 0) {
-      setTimeout(mountPrebuffer, mountDelay);
+    const forceFinal = (reason) => {
+      if (!tokenValid(token)) return;
+      logEvent('error', reason);
+      errorCountRef.current += 1;
+      if (armedSwap) return;
+      armedSwap = true;
+      nextImg.style.transition = 'none';
+      nextImg.style.opacity = '1';
+      prevImg.style.transition = 'none';
+      prevImg.style.opacity = '0';
+      activeImageRef.current = toKey;
+      finalizeSwap(token, nextItem, nextIdx);
+    };
+
+    swapDeadlineRef.current = setTimeout(() => forceFinal('image-decode-timeout'), SWAP_TIMEOUT_MS);
+
+    const onErr = () => forceFinal(`image-onerror ${basename(nextItem.file_path)}`);
+
+    if (typeof nextImg.decode === 'function') {
+      nextImg.decode().then(beginCrossfade).catch(onErr);
+    } else if (nextImg.complete && nextImg.naturalWidth > 0) {
+      beginCrossfade();
     } else {
-      mountPrebuffer();
+      const handleLoad = () => { nextImg.removeEventListener('load', handleLoad); beginCrossfade(); };
+      const handleErr = () => { nextImg.removeEventListener('error', handleErr); onErr(); };
+      nextImg.addEventListener('load', handleLoad, { once: true });
+      nextImg.addEventListener('error', handleErr, { once: true });
     }
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap]);
 
-  const requestTransition = useCallback(() => {
-    if (transitionStateRef.current !== 'DISPLAYING') return;
+  const runVideoToImage = useCallback((nextItem, nextIdx) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const fromKey = activeImageRef.current; // last visible image layer (likely hidden)
+    const toKey = fromKey === 'A' ? 'B' : 'A';
+    const nextImg = toKey === 'A' ? imageARef.current : imageBRef.current;
+    if (!nextImg) return;
 
-    if (timerRef.current) { clearTimeout(timerRef.current); timerRef.current = null; }
+    const token = bumpToken();
+    swapStartAtRef.current = performance.now();
+    goState(STATE_SWAPPING);
 
-    if (applyPendingIfNeeded()) { prebufferedLayerRef.current = null; return; }
+    logEvent('lifecycle', `image src-set ${basename(nextItem.file_path)} [next=${toKey}]`);
+    nextImg.style.transition = 'none';
+    nextImg.style.opacity = '0';
+    nextImg.src = nextItem.file_path;
 
-    // Fast path: next item is already pre-buffered — flip instantly.
-    // Covers image→video and image→image transitions (image timer fires here);
-    // video→{anything} fast-path lives in handleVideoEnd. No outgoing-hold needed
-    // here because the active layer (image) is on top with zIndex 2 covering the
-    // fading-out item underneath.
-    if (prebufferedLayerRef.current !== null) {
-      const readyLayer = prebufferedLayerRef.current;
+    const decodeStart = performance.now();
+    let armedSwap = false;
 
-      if (nextIndexRef.current === 0 && currentIdxRef.current !== 0) {
-        logEvent('=== LOOP RESTART ===');
-      }
-
-      currentIdxRef.current = nextIndexRef.current;
-      activeLayerRef.current = readyLayer;
-      prebufferedLayerRef.current = null;
-      transitionStateRef.current = 'DISPLAYING';
-      const item = mediaRef.current[currentIdxRef.current];
-      flipAtRef.current = performance.now();
-      firstFrameLayerRef.current = item?.media_type === 'video' ? readyLayer : -1;
-      setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
-      const flipRs = videoRefs[readyLayer].current?.readyState ?? 'n/a';
-      logEvent(`setActiveLayer → ${readyLayer} (fast path, rs=${flipRs})`);
-      startDisplayClock(item);
-      return;
-    }
-
-    const currentMedia = mediaRef.current;
-    if (currentMedia.length <= 1) return;
-
-    transitionStateRef.current = 'LOADING_NEXT';
-
-    const nextIdx = (currentIdxRef.current + 1) % currentMedia.length;
-    nextIndexRef.current = nextIdx;
-
-    const inactiveLayer = activeLayerRef.current === 0 ? 1 : 0;
-    expectedLayerRef.current = inactiveLayer;
-
-    setLayerMedia(prev => { const next = [...prev]; next[inactiveLayer] = nextIdx; return next; });
-    setLayerSeq(prev => { const next = [...prev]; next[inactiveLayer] += 1; return next; });
-  }, [applyPendingIfNeeded, startDisplayClock, logEvent]);
-
-  const handleLayerReady = useCallback((layerIdx) => {
-    // Case B: pre-buffer completion — fired while current item is still DISPLAYING
-    if (transitionStateRef.current === 'DISPLAYING') {
-      if (layerIdx !== expectedLayerRef.current) return;
-      // Primary guard: freeze sequence is already in progress — block re-entry.
-      // Handles synchronous onCanPlay re-fires that occur inside play() on some
-      // WebKit/Tizen builds before JS yields back to the event loop.
-      if (prebufferFrozenRef.current) return;
-      const item = mediaRef.current[nextIndexRef.current];
-      logEvent(`prebuffer ready via onCanPlay [${layerIdx}] — ${item?.file_path?.split('/').pop()}`);
-      // Note: previously we ran a play()→pause()→currentTime=0 "freeze" here to
-      // guarantee frame 0 at flip. With the off-screen translate (renderLayer
-      // offscreen rule), Tizen decodes the inactive video naturally and it sits
-      // at currentTime=0 since play() was never called. The autoplay useEffect
-      // calls play() at flip. Keeping prebufferFrozenRef and expectedLayerRef=-1
-      // as safety belts against any residual onCanPlay re-fires.
-      prebufferFrozenRef.current = true;
-      prebufferedLayerRef.current = layerIdx;
-      // Secondary guard: blocks async onCanPlay re-fires (future event-loop ticks).
-      expectedLayerRef.current = -1;
-      return;
-    }
-
-    // Case A: normal transition — LOADING_NEXT → flip → DISPLAYING
-    if (transitionStateRef.current !== 'LOADING_NEXT') return;
-    if (layerIdx !== expectedLayerRef.current) return;
-
-    transitionStateRef.current = 'FADING';
-    activeLayerRef.current = layerIdx;
-    currentIdxRef.current = nextIndexRef.current;
-
-    const nextItem = mediaRef.current[currentIdxRef.current];
-    flipAtRef.current = performance.now();
-    firstFrameLayerRef.current = nextItem?.media_type === 'video' ? layerIdx : -1;
-    setActiveLayer(layerIdx);
-    const flipRs = videoRefs[layerIdx].current?.readyState ?? 'n/a';
-    logEvent(`setActiveLayer → ${layerIdx} (slow path, rs=${flipRs})`);
-
-    if (nextItem?.media_type !== 'image') {
-      // Video: enter DISPLAYING immediately and kick off the pre-buffer cycle
-      transitionStateRef.current = 'DISPLAYING';
-      startDisplayClock(nextItem);
-    } else {
-      // Image: wait for CSS crossfade, then start display clock
-      setTimeout(() => { startDisplayClock(nextItem); }, CROSSFADE_DURATION);
-    }
-  }, [startDisplayClock, logEvent]);
-
-  const handleVideoEnd = useCallback(() => {
-    if (transitionStateRef.current !== 'DISPLAYING') return;
-    logEvent(`onEnded [${activeLayerRef.current}]`);
-
-    if (prebufferedLayerRef.current !== null) {
-      // Fast path: pre-buffered video is frozen at frame 0 — instant flip
-      const readyLayer = prebufferedLayerRef.current;
-      const departingLayer = activeLayerRef.current;
-      const nextItem = mediaRef.current[nextIndexRef.current];
-
-      if (nextIndexRef.current === 0 && currentIdxRef.current !== 0) {
-        logEvent('=== LOOP RESTART ===');
-      }
-
-      // Video → Image: hold the outgoing video as backdrop so the image's
-      // 500 ms opacity fade-in is composited over the previous frame instead
-      // of the black container background. Cleared after CROSSFADE_DURATION,
-      // guarded against rapid re-transitions overwriting outgoingHoldRef.
-      if (nextItem?.media_type === 'image') {
-        outgoingHoldRef.current = departingLayer;
-        logEvent(`outgoingHold start [${departingLayer}]`);
+    const beginCrossfade = () => {
+      if (!tokenValid(token)) return;
+      if (armedSwap) return;
+      armedSwap = true;
+      const elapsed = Math.round(performance.now() - decodeStart);
+      logEvent('success', `image decoded (${elapsed}ms)`);
+      requestAnimationFrame(() => {
+        if (!tokenValid(token)) return;
+        logEvent('state', `image fade start [video→${toKey}]`);
+        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        nextImg.style.opacity = '1';
+        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        v.style.opacity = '0';
+        logEvent('lifecycle', 'video opacity 1→0');
         setTimeout(() => {
-          if (outgoingHoldRef.current === departingLayer) {
-            outgoingHoldRef.current = null;
-            logEvent(`outgoingHold end [${departingLayer}]`);
-          }
+          if (!tokenValid(token)) return;
+          logEvent('state', `image fade end [video→${toKey}]`);
+          try { v.pause(); logEvent('lifecycle', 'video paused'); } catch (_) {}
+          activeImageRef.current = toKey;
+          finalizeSwap(token, nextItem, nextIdx);
         }, CROSSFADE_DURATION);
-      }
+      });
+    };
 
-      currentIdxRef.current = nextIndexRef.current;
-      activeLayerRef.current = readyLayer;
-      prebufferedLayerRef.current = null;
-      transitionStateRef.current = 'DISPLAYING';
-      flipAtRef.current = performance.now();
-      firstFrameLayerRef.current = nextItem?.media_type === 'video' ? readyLayer : -1;
-      setActiveLayer(readyLayer); // autoplay useEffect fires → play() from frame 0
-      const flipRs = videoRefs[readyLayer].current?.readyState ?? 'n/a';
-      logEvent(`setActiveLayer → ${readyLayer} (fast path, rs=${flipRs})`);
-      startDisplayClock(nextItem); // immediately pre-buffer the item after this one
-      return;
+    const forceFinal = (reason) => {
+      if (!tokenValid(token)) return;
+      logEvent('error', reason);
+      errorCountRef.current += 1;
+      if (armedSwap) return;
+      armedSwap = true;
+      nextImg.style.transition = 'none';
+      nextImg.style.opacity = '1';
+      v.style.transition = 'none';
+      v.style.opacity = '0';
+      try { v.pause(); } catch (_) {}
+      activeImageRef.current = toKey;
+      finalizeSwap(token, nextItem, nextIdx);
+    };
+
+    swapDeadlineRef.current = setTimeout(() => forceFinal('image-decode-timeout'), SWAP_TIMEOUT_MS);
+
+    const onErr = () => forceFinal(`image-onerror ${basename(nextItem.file_path)}`);
+
+    if (typeof nextImg.decode === 'function') {
+      nextImg.decode().then(beginCrossfade).catch(onErr);
+    } else if (nextImg.complete && nextImg.naturalWidth > 0) {
+      beginCrossfade();
+    } else {
+      const handleLoad = () => { nextImg.removeEventListener('load', handleLoad); beginCrossfade(); };
+      const handleErr = () => { nextImg.removeEventListener('error', handleErr); onErr(); };
+      nextImg.addEventListener('load', handleLoad, { once: true });
+      nextImg.addEventListener('error', handleErr, { once: true });
+    }
+  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap]);
+
+  const runImageToVideo = useCallback((nextItem, nextIdx) => {
+    const v = videoRef.current;
+    if (!v) return;
+    const activeKey = activeImageRef.current;
+    const activeImg = activeKey === 'A' ? imageARef.current : imageBRef.current;
+    if (!activeImg) return;
+
+    const token = bumpToken();
+    swapStartAtRef.current = performance.now();
+    goState(STATE_SWAPPING);
+
+    const url = nextItem.file_path;
+    logEvent('lifecycle', `src-set ${basename(url)}`);
+    v.style.transition = 'none';
+    v.style.opacity = '0';
+    v.src = url;
+    v.load();
+    logEvent('lifecycle', 'load() called');
+
+    swapDeadlineRef.current = setTimeout(() => {
+      if (!tokenValid(token)) return;
+      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade`);
+      v.style.transition = 'none';
+      v.style.opacity = '1';
+      activeImg.style.transition = 'none';
+      activeImg.style.opacity = '0';
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      finalizeSwap(token, nextItem, nextIdx);
+    }, SWAP_TIMEOUT_MS);
+
+    logEvent('lifecycle', 'play() requested');
+    playStartAtRef.current = performance.now();
+    const p = v.play();
+    if (p && typeof p.then === 'function') {
+      p.then(() => logEvent('success', 'play() resolved'))
+       .catch((e) => { errorCountRef.current += 1; logEvent('error', `play() rejected: ${e?.name ?? 'Error'}`); });
     }
 
-    // Slow path: pre-buffer wasn't ready, fall back to normal transition
-    requestTransition();
-  }, [requestTransition, startDisplayClock, logEvent]);
+    startFirstFrameLoop(token, () => {
+      if (swapDeadlineRef.current) { clearTimeout(swapDeadlineRef.current); swapDeadlineRef.current = null; }
+      if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
+      requestAnimationFrame(() => {
+        if (!tokenValid(token)) return;
+        logEvent('state', `image fade out [${activeKey}]`);
+        logEvent('state', 'video fade in');
+        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        v.style.opacity = '1';
+        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        activeImg.style.opacity = '0';
+        setTimeout(() => {
+          if (!tokenValid(token)) return;
+          finalizeSwap(token, nextItem, nextIdx);
+        }, CROSSFADE_DURATION);
+      });
+    });
+  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop]);
 
-  /* ---------------- VIDEO AUTOPLAY ---------------- */
+  /* --------------------------------- ADVANCE -------------------------------- */
 
-  useEffect(() => {
-    const idx = layerMedia[activeLayer];
-    if (idx === null || idx === undefined || !media[idx]) return;
-    if (media[idx].media_type === 'video') {
-      const ref = videoRefs[activeLayer];
-      if (ref.current) {
-        ref.current.currentTime = 0;
-        const p = ref.current.play();
-        // Some very old WebKit builds return undefined from play(); guard the chain.
+  const advance = useCallback(() => {
+    if (stateRef.current !== STATE_PLAYING) return;
+    if (mediaRef.current.length === 0) return;
+    const currentIdx = currentIdxRef.current;
+    const nextIdx = (currentIdx + 1) % mediaRef.current.length;
+    const currentItem = mediaRef.current[currentIdx];
+    const nextItem = mediaRef.current[nextIdx];
+    if (!nextItem) return;
+
+    if (nextIdx === 0 && currentIdx !== 0) {
+      logEvent('lifecycle', `=== LOOP RESTART (item ${currentIdx} → item 0) ===`);
+    }
+
+    // Single-item playlist
+    if (mediaRef.current.length === 1) {
+      if (currentItem?.media_type === 'image') {
+        armImageTimer();
+        return;
+      }
+      // Single video — replay via video→video swap so the loop frame is bridged
+    }
+
+    const fromType = currentItemTypeRef.current;
+    const toType = nextItem.media_type;
+    if (fromType === 'video' && toType === 'video') runVideoToVideo(nextItem, nextIdx);
+    else if (fromType === 'video' && toType === 'image') runVideoToImage(nextItem, nextIdx);
+    else if (fromType === 'image' && toType === 'image') runImageToImage(nextItem, nextIdx);
+    else if (fromType === 'image' && toType === 'video') runImageToVideo(nextItem, nextIdx);
+    else logEvent('error', `unknown transition kind: ${fromType}→${toType}`);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [logEvent, runVideoToVideo, runVideoToImage, runImageToImage, runImageToVideo]);
+
+  function armImageTimer(durationMs = IMAGE_DURATION) {
+    if (imageTimerRef.current) clearTimeout(imageTimerRef.current);
+    imageTimerRef.current = setTimeout(() => { advanceRef.current?.(); }, durationMs);
+  }
+
+  // advanceRef indirection so armImageTimer (declared outside useCallback) sees latest advance
+  const advanceRef = useRef(null);
+  useEffect(() => { advanceRef.current = advance; }, [advance]);
+
+  /* ----------------------------------- START -------------------------------- */
+
+  const start = useCallback((item) => {
+    if (!item) return;
+    if (!bridgeCtxRef.current && bridgeCanvasRef.current) {
+      bridgeCtxRef.current = bridgeCanvasRef.current.getContext('2d');
+    }
+    bumpToken();
+    currentIdxRef.current = 0;
+    currentItemTypeRef.current = item.media_type;
+    goState(STATE_PLAYING);
+    logEvent('lifecycle', `render: init (${basename(item.file_path)})`);
+
+    if (item.media_type === 'image') {
+      const img = activeImageRef.current === 'A' ? imageARef.current : imageBRef.current;
+      if (img) {
+        img.style.transition = 'none';
+        img.style.opacity = '1';
+        img.src = item.file_path;
+      }
+      if (mediaRef.current.length > 1) armImageTimer();
+    } else {
+      const v = videoRef.current;
+      if (v) {
+        v.style.transition = 'none';
+        v.style.opacity = '1';
+        v.src = item.file_path;
+        logEvent('lifecycle', `src-set ${basename(item.file_path)}`);
+        v.load();
+        logEvent('lifecycle', 'load() called');
+        logEvent('lifecycle', 'play() requested');
+        const p = v.play();
         if (p && typeof p.then === 'function') {
-          p.then(() => logEvent(`play() resolved [${activeLayer}]`))
-           .catch((e) => logEvent(`play() rejected [${activeLayer}]: ${e?.name ?? 'Error'}`));
+          p.then(() => logEvent('success', 'play() resolved'))
+           .catch((e) => { errorCountRef.current += 1; logEvent('error', `play() rejected: ${e?.name ?? 'Error'}`); });
         }
       }
     }
-  }, [activeLayer, layerMedia, media, logEvent]);
 
-  /* ---------------- PUBLISH ---------------- */
+    if (mediaRef.current.length > 1) {
+      const nextIdx = (currentIdxRef.current + 1) % mediaRef.current.length;
+      startPrefetch(mediaRef.current[nextIdx]);
+    }
+  }, [bumpToken, goState, logEvent, startPrefetch]);
+
+  /* ----------------------------- AUTOSTART EFFECT --------------------------- */
+
+  useEffect(() => {
+    if (stateRef.current !== STATE_IDLE) return;
+    if (!display || media.length === 0) return;
+    if (!videoRef.current || !imageARef.current || !imageBRef.current || !bridgeCanvasRef.current) return;
+    logEvent('lifecycle', 'mount [video]');
+    logEvent('lifecycle', 'mount [img-A]');
+    logEvent('lifecycle', 'mount [img-B]');
+    logEvent('lifecycle', 'mount [bridge]');
+    start(media[0]);
+  }, [display, media, start, logEvent]);
+
+  /* -------------------------------- CLEANUP --------------------------------- */
+
+  useEffect(() => {
+    return () => {
+      if (imageTimerRef.current) clearTimeout(imageTimerRef.current);
+      if (swapDeadlineRef.current) clearTimeout(swapDeadlineRef.current);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      bumpToken();
+    };
+  }, [bumpToken]);
+
+  /* --------------------------- EARLY-BRIDGE WATCHER ------------------------- */
+
+  const handleVideoTimeUpdate = useCallback(() => {
+    if (!EARLY_BRIDGE_CAPTURE) return;
+    if (stateRef.current !== STATE_PLAYING) return;
+    if (currentItemTypeRef.current !== 'video') return;
+    if (earlyBridgeArmedRef.current) return;
+    const v = videoRef.current;
+    if (!v || !v.duration || !isFinite(v.duration)) return;
+    if (v.currentTime < v.duration - (EARLY_BRIDGE_LEAD_MS / 1000)) return;
+    // Peek next item type
+    const nextIdx = (currentIdxRef.current + 1) % mediaRef.current.length;
+    if (mediaRef.current[nextIdx]?.media_type !== 'video') return;
+    earlyBridgeArmedRef.current = true;
+    captureBridge();
+    setBridgeOpacity(1, 0);
+    logEvent('state', 'early-bridge-capture armed');
+  }, [captureBridge, setBridgeOpacity, logEvent]);
+
+  /* ------------------------------ VIDEO HANDLERS ---------------------------- */
+
+  const handleVideoEnded = useCallback(() => {
+    logEvent('lifecycle', 'ended');
+    if (stateRef.current !== STATE_PLAYING) return;
+    advance();
+  }, [logEvent, advance]);
+
+  const handleVideoError = useCallback(() => {
+    const v = videoRef.current;
+    const code = v?.error?.code ?? '?';
+    const msg = v?.error?.message ?? '';
+    errorCountRef.current += 1;
+    logEvent('error', `onError name=${code} msg=${msg}`);
+    if (stateRef.current === STATE_SWAPPING && swapDeadlineRef.current) {
+      // Fast-fail the swap
+      clearTimeout(swapDeadlineRef.current);
+      swapDeadlineRef.current = setTimeout(() => {}, 0);
+    }
+  }, [logEvent]);
+
+  const handleVideoPlaying = useCallback(() => { logEvent('lifecycle', 'playing event'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoPause = useCallback(() => { logEvent('lifecycle', 'paused'); }, [logEvent]);
+  const handleVideoLoadStart = useCallback(() => { logEvent('lifecycle', 'loadstart'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoLoadedData = useCallback(() => { logEvent('lifecycle', 'loadeddata'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoLoadedMetadata = useCallback(() => { logEvent('lifecycle', 'loadedmetadata'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoCanPlay = useCallback(() => { logEvent('lifecycle', 'canplay (observational)'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoCanPlayThrough = useCallback(() => { logEvent('lifecycle', 'canplaythrough (observational)'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
+  const handleVideoSeeked = useCallback(() => { logEvent('lifecycle', 'seeked'); }, [logEvent]);
+
+  /* --------------------------------- PUBLISH -------------------------------- */
 
   const handlePublish = useCallback(async () => {
     setPublishing(true);
@@ -393,14 +797,12 @@ export function AmbientViewerPage() {
     }
   }, [id, previewPlaylist]);
 
-  /* ---------------- RENDER ---------------- */
+  /* ----------------------------------- UI ----------------------------------- */
 
   const orientation = display?.orientation || 'landscape';
-
-  const colorBarHeight =
-    orientation === 'portrait'
-      ? 'clamp(8px, 1.35vh, 15px)'
-      : 'clamp(10px, 1.8vh, 20px)';
+  const colorBarHeight = orientation === 'portrait'
+    ? 'clamp(8px, 1.35vh, 15px)'
+    : 'clamp(10px, 1.8vh, 20px)';
 
   const containerStyle = useMemo(() => {
     if (orientation === 'portrait') {
@@ -433,83 +835,37 @@ export function AmbientViewerPage() {
     );
   }
 
-  const handleTimeUpdate = (layerIdx) => {
-    if (firstFrameLayerRef.current !== layerIdx) return;
-    const v = videoRefs[layerIdx].current;
-    if (!v || v.currentTime <= 0) return;
-    const delta = Math.round(performance.now() - flipAtRef.current);
-    logEvent(`flip → first-frame [${layerIdx}]: ${delta}ms`);
-    firstFrameLayerRef.current = -1;
-  };
-
-  const handleMediaError = (layerIdx, item) => {
-    errorCountRef.current += 1;
-    const filename = item?.file_path?.split('/').pop() ?? '?';
-    const v = videoRefs[layerIdx].current;
-    const code = v?.error?.code ?? '';
-    logEvent(`onError [${layerIdx}] ${filename}${code ? ` code=${code}` : ''}`);
-  };
-
-  const renderLayer = (layerIdx) => {
-    const mediaIdx = layerMedia[layerIdx];
-    if (mediaIdx === null || mediaIdx === undefined) return null;
-    const item = media[mediaIdx];
-    if (!item) return null;
-    const src = item.file_path;
-    const isActive = activeLayer === layerIdx;
-
-    const isVideo = item.media_type === 'video';
-    // Tizen WebKit suppresses video decode on opacity:0 layers. Keep inactive
-    // video at opacity 1 and instead translate it offscreen so it is composited
-    // (and therefore decoded) without being visible. Images still crossfade via
-    // opacity. The outgoingHoldRef exception keeps a just-departed video on-screen
-    // underneath an incoming image during the 500 ms opacity fade-in.
-    const offscreen = isVideo && !isActive && outgoingHoldRef.current !== layerIdx;
-
-    return (
-      <div
-        key={layerIdx}
-        style={{
-          position: 'absolute',
-          inset: 0,
-          opacity: isVideo ? 1 : (isActive ? 1 : 0),
-          transform: offscreen ? 'translateX(-200vw)' : 'none',
-          transition: item.media_type === 'image' ? `opacity ${CROSSFADE_DURATION}ms ease` : 'none',
-          zIndex: isActive ? 2 : 1,
-        }}
-      >
-        {item.media_type === 'video' ? (
-          <video
-            key={layerSeq[layerIdx]}
-            ref={videoRefs[layerIdx]}
-            src={src}
-            muted
-            playsInline
-            preload="auto"
-            onCanPlay={() => handleLayerReady(layerIdx)}
-            onEnded={isActive ? handleVideoEnd : undefined}
-            onTimeUpdate={() => handleTimeUpdate(layerIdx)}
-            onError={() => handleMediaError(layerIdx, item)}
-            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-          />
-        ) : (
-          <img
-            key={layerSeq[layerIdx]}
-            src={src}
-            alt=""
-            onLoad={() => handleLayerReady(layerIdx)}
-            onError={() => handleMediaError(layerIdx, item)}
-            style={{ width: '100%', height: '100%', objectFit: 'cover' }}
-          />
-        )}
-      </div>
-    );
-  };
-
   const announcementLabel = display.announcement_label || 'Actis welcomes';
   const announcementName = display.announcement_name || '';
   const announcementTitle = display.announcement_title || '';
   const showAnnouncement = !!display.announcement_enabled && (announcementName || announcementTitle);
+
+  const layerStyle = (z) => ({
+    position: 'absolute',
+    inset: 0,
+    width: '100%',
+    height: '100%',
+    objectFit: 'cover',
+    opacity: 0,
+    transition: 'none',
+    zIndex: z,
+    willChange: 'opacity',
+    pointerEvents: 'none',
+  });
+
+  const stateColor = stateRef.current === STATE_SWAPPING ? '#fc7'
+    : stateRef.current === STATE_PLAYING ? '#7f7'
+    : '#888';
+  const currentItem = mediaRef.current[currentIdxRef.current];
+  const currentName = currentItem ? basename(currentItem.file_path) : '—';
+  const v = videoRef.current;
+  const rs = v?.readyState ?? '?';
+  const ns = v?.networkState ?? '?';
+  const ct = v ? v.currentTime.toFixed(2) : '0.00';
+  const dur = v && v.duration && isFinite(v.duration) ? v.duration.toFixed(1) : '?';
+  const paused = v ? (v.paused ? 'T' : 'F') : '?';
+  const muted = v ? (v.muted ? 'T' : 'F') : '?';
+  const bridgeOn = (bridgeCanvasRef.current && bridgeCanvasRef.current.style.opacity === '1');
 
   return (
     <div
@@ -524,36 +880,92 @@ export function AmbientViewerPage() {
       }}
     >
       <div style={containerStyle}>
-        {renderLayer(0)}
-        {renderLayer(1)}
+        <video
+          ref={videoRef}
+          muted
+          playsInline
+          preload="auto"
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            objectFit: 'cover',
+            opacity: 0,
+            transition: 'none',
+            zIndex: 1,
+            willChange: 'opacity',
+            background: '#000',
+          }}
+          onEnded={handleVideoEnded}
+          onError={handleVideoError}
+          onPlaying={handleVideoPlaying}
+          onPause={handleVideoPause}
+          onLoadStart={handleVideoLoadStart}
+          onLoadedData={handleVideoLoadedData}
+          onLoadedMetadata={handleVideoLoadedMetadata}
+          onCanPlay={handleVideoCanPlay}
+          onCanPlayThrough={handleVideoCanPlayThrough}
+          onTimeUpdate={handleVideoTimeUpdate}
+          onSeeked={handleVideoSeeked}
+        />
+        <img ref={imageARef} alt="" style={layerStyle(2)} />
+        <img ref={imageBRef} alt="" style={layerStyle(2)} />
+        <canvas
+          ref={bridgeCanvasRef}
+          style={{
+            position: 'absolute',
+            inset: 0,
+            width: '100%',
+            height: '100%',
+            opacity: 0,
+            zIndex: 3,
+            pointerEvents: 'none',
+            willChange: 'opacity',
+          }}
+        />
 
         {isDebug && (
-          <div style={{
-            position: 'fixed', top: 0, left: 0, zIndex: 999,
-            pointerEvents: 'none', padding: 8,
-            background: 'rgba(0,0,0,0.78)', color: '#0f0',
-            fontFamily: 'monospace', fontSize: 10, lineHeight: 1.5,
-            maxWidth: 380,
-          }}>
-            <div>State: <b>{transitionStateRef.current}</b></div>
-            <div>Active Layer: <b>{activeLayerRef.current}</b></div>
-            <div>Pre-buffer: <b>{prebufferedLayerRef.current ?? 'none'}</b></div>
-            <div>OutgoingHold: <b>{outgoingHoldRef.current ?? 'none'}</b></div>
-            <div>Errors: <b style={{ color: errorCountRef.current > 0 ? '#f66' : '#0f0' }}>{errorCountRef.current}</b></div>
-            {[0, 1].map(li => {
-              const mIdx = layerMedia[li];
-              const fname = mIdx != null ? (mediaRef.current[mIdx]?.file_path?.split('/').pop() ?? '?') : '—';
-              return (
-                <div key={li}>
-                  L{li}: {fname}
-                  {prebufferedLayerRef.current === li ? '  PRE-BUFFERED' : ''}
-                  {activeLayerRef.current === li ? '  ACTIVE' : ''}
-                </div>
-              );
-            })}
-            <hr style={{ borderColor: '#0f04', margin: '4px 0' }} />
+          <div
+            style={{
+              position: 'fixed',
+              top: 0,
+              left: 0,
+              zIndex: 999,
+              pointerEvents: 'none',
+              padding: '6px 8px',
+              maxWidth: 'min(46vw, 520px)',
+              background: 'rgba(0,0,0,0.85)',
+              color: '#0f0',
+              fontFamily: 'monospace',
+              fontSize: 12,
+              lineHeight: 1.25,
+              border: '1px solid rgba(0,255,128,0.35)',
+            }}
+          >
+            <div style={{ color: stateColor, fontWeight: 700 }}>STATE: {stateRef.current}</div>
+            <div>ITEM:  {currentName} ({ct}s / {dur}s)</div>
+            <div>rs={rs} ns={ns} ct={ct} paused={paused} muted={muted}</div>
+            <div>BRIDGE: {bridgeOn ? 'on' : 'off'}    PREFETCH: {prefetchNameRef.current} ({prefetchStatusRef.current})</div>
+            <div>
+              ERRORS: <span style={{ color: errorCountRef.current > 0 ? '#f77' : '#7f7' }}>{errorCountRef.current}</span>
+              {'   '}LAST-SWAP: {lastSwapMsRef.current}ms
+            </div>
+            <div>FPS: {fpsRateRef.current} (last 2s)</div>
+            <hr style={{ borderColor: 'rgba(0,255,128,0.25)', margin: '4px 0' }} />
             {eventLogRef.current.map((e, i) => (
-              <div key={i} style={{ opacity: Math.max(0.15, 1 - i * 0.065) }}>{e}</div>
+              <div
+                key={i}
+                style={{
+                  color: COLOR_BY_CLASS[e.klass] || '#ddd',
+                  opacity: Math.max(0.25, 1 - i * 0.025),
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {e.ts}  {e.msg}
+              </div>
             ))}
           </div>
         )}

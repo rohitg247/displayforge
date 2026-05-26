@@ -240,3 +240,100 @@ If `rs=2` recurs at flips, Tizen suppresses decode on translated layers too — 
 
 - All new code references `CROSSFADE_DURATION` (the existing single constant) rather than the literal `500`. The 300 ms / 900 ms in the readiness fallback are intentionally distinct values and remain inline.
 - No new dependencies, no state machine restructuring, no backend changes.
+
+---
+
+## 2026-05-26 — Full Engine Rewrite: Single-Video + Bridge Architecture
+
+**File:** `src/pages/AmbientViewerPage.jsx` (685 lines → ~840 lines, complete playback-engine rewrite).
+**Spec:** `~/.claude/plans/i-need-you-to-streamed-sketch.md` (sections A–H).
+
+### Problem (confirmed by the 2026-05-18 diagnostic overlay)
+
+Every video swap on the Tizen panel resolved via the **time-based** `prebuffer fallback`, never via `onCanPlay`. `flip → first-frame [N]` lines were missing entirely. Stale-image flashes and loop-boundary glitches persisted. `translateX(-200vw)` did **not** restore decode on the hidden layer — Tizen WebKit suppresses video decode on any non-visible `<video>`, regardless of how it's hidden.
+
+The dual-layer hidden-video pre-buffer model is therefore architecturally incompatible with Tizen WebKit. No timing tweak, mutex, or `readyState` poll can close the gap. The previous five revision cycles were treating symptoms.
+
+### Solution: browser-compatible analog of MagicINFO's native AVPlay pattern
+
+- **One** persistent visible `<video>` element. Never unmounted, never moved, full-bleed at z=1.
+- **Two** persistent `<img>` layers (`image-A`, `image-B`) at z=2 for image-only crossfades.
+- **One** `<canvas>` bridge at z=3. During video→video swaps, capture the last frame of the outgoing video to canvas, raise canvas opacity to 1, change `video.src`, wait for *first paintable frame* (rAF + `currentTime > 0` for 2 consecutive ticks), then fade the canvas out over 150 ms. Result: zero black frames because the bridge always shows real pixels.
+- **Network-only prefetch** via `fetch(url, { cache: 'force-cache' })` — warms the HTTP cache; never mounts a second `<video>` and so never contends for the single hardware decoder.
+- **3-state machine**: `IDLE`, `PLAYING`, `SWAPPING`. Token-based stale-callback guards on every async boundary.
+
+### Transition matrix (case-by-case)
+
+| Outgoing → Incoming | Cover mechanism | First-frame signal |
+|---|---|---|
+| video → video (C.1) | Canvas bridge (last frame) | rAF: `ct > 0` for 2 consecutive ticks |
+| video → image (C.2) | Outgoing video held at opacity 1 underneath; incoming image fades in over it | `img.decode()` or `onload` |
+| image → image (C.3) | Standard opacity crossfade between img-A and img-B | `img.decode()` or `onload` |
+| image → video (C.4) | Outgoing image held at opacity 1; incoming video fades in after first-frame confirmed | rAF first-frame loop |
+
+`onCanPlay` / `onCanPlayThrough` are logged for observability but **never** used as a flip trigger. `playing` event is logged but never used either. The only authoritative first-frame signal is `currentTime > 0` for two consecutive rAF ticks (D1).
+
+### What was removed
+
+Deleted refs: `expectedLayerRef`, `activeLayerRef`, `prebufferedLayerRef`, `prebufferFrozenRef`, `outgoingHoldRef`, `flipAtRef`, `firstFrameLayerRef`, `nextIndexRef`, `errorCountRef` (replaced), `transitionStateRef` (replaced by `stateRef`), `videoRefs[]` (replaced by single `videoRef`).
+Deleted state: `activeLayer`, `layerMedia`, `layerSeq`.
+Deleted functions: `renderLayer(0/1)`, `handleLayerReady`, `handleVideoEnd`, `handleTimeUpdate` (replaced), `handleMediaError` (replaced). The 300/900 ms fallback ladder and the `play()→pause()→currentTime=0` freeze sequence are gone.
+
+### Tizen-specific decisions locked in (see plan section D)
+
+- `video.muted=true`, `playsInline=true`, `preload="auto"`, `autoplay={false}` — always.
+- `videoEl.src` is set imperatively; the React `src` prop is **not bound** (prevents accidental remount).
+- `video.src` is never set to `''` or removed — preserves decoder state between an image segment and the next video.
+- `EARLY_BRIDGE_CAPTURE` constant exists as a gated escape hatch (off by default). Only flip to `true` after device evidence that the `onended`-time frame is unpaintable on a specific firmware.
+- No `requestVideoFrameCallback` (Chromium-only, absent on Tizen WebKit). No user-agent sniffing.
+
+### Diagnostics HUD (rebuilt from scratch)
+
+`?debug=true` enables the HUD. `?debug=verbose` additionally enables per-rAF `ct` logging.
+
+- Fixed top-left, 12 px monospace, max-width `min(46vw, 520px)`, green border, dark background — sized for legibility from a phone photo of the TV.
+- 6-line **header** (always visible): `STATE`, `ITEM` with `ct/duration`, `rs / ns / ct / paused / muted`, `BRIDGE` + `PREFETCH` status, `ERRORS` + `LAST-SWAP`, `FPS` (rolling 2 s).
+- 30-entry log ring (doubled from 15), latest at top, opacity fade for older entries.
+- `MM:SS.mmm` wall-clock timestamps anchored at mount.
+- 6 color classes: `lifecycle` (cyan), `success` (green), `warn` (yellow), `error` (red), `state` (orange), `verbose` (grey).
+- Mandatory event vocabulary: every meaningful event uses an exact phrase (`src-set <name>`, `load() called`, `play() requested|resolved|rejected: <Err>`, `first-frame ct=N.NN (Nms after play)`, `bridge on (WxH)` / `bridge off (Nms after swap)`, `bridge-capture-failed: <reason>`, `state: A → B`, `image fade start/end [from→to]`, `=== LOOP RESTART (item N → item 0) ===`, `guard: stale-callback`, `swap-timeout (2000ms) — forcing fade`, `frame-stuck` / `frame-stuck-fatal`, `decode slow (Nms)`).
+- Frame-advancement watchdog inside the rAF loop: warns at 500 ms stagnation, force-reloads at 1500 ms, lets `swap-timeout` fire at 2000 ms.
+
+### Failure handling (degraded modes — engine never stalls)
+
+| Failure | Action | Outcome |
+|---|---|---|
+| `drawImage` throws | log `bridge-capture-failed`, skip bridge, continue | one black frame at worst (same as baseline) |
+| No first-frame within 2000 ms | log `swap-timeout`, force fade, `finalizeSwap` regardless | state machine resyncs |
+| `play()` rejected (autoplay) | log + increment error counter; do not retry within swap | next `advance` retries |
+| Frame stuck | warn at 500 ms, force `load()+play()` at 1500 ms, timeout at 2000 ms | engine advances |
+| Mid-swap playlist update | stored in `pendingDataRef`; applied in `finalizeSwap` | smooth — current swap completes, then new playlist takes over |
+| Image decode failure / timeout | log `image-onerror` or `image-decode-timeout`, force final opacity values, call `finalizeSwap` normally | engine continues; next dwell timer arms |
+| Loop boundary | logged with `=== LOOP RESTART ===`; identical to any other `advance` | no glitch by design |
+| `videoWidth=0` at capture | fall back to `clientWidth/Height`, then skip bridge if still zero | bridge-failure path |
+| `reset()` mid-swap | token bump kills all in-flight callbacks; bridge forced to opacity 0 | clean teardown |
+
+### Constants (centralized at file top)
+
+`IMAGE_DURATION = 5000`, `CROSSFADE_DURATION = 500`, `BRIDGE_FADE_DURATION = 150`, `SWAP_TIMEOUT_MS = 2000`, `POLL_INTERVAL = 5000`, `DECODE_SLOW_THRESHOLD_MS = 800`, `FRAME_STUCK_WARN_MS = 500`, `FRAME_STUCK_FATAL_MS = 1500`, `LOG_RING_SIZE = 30`, `DEBUG_TICK_MS = 200`, `EARLY_BRIDGE_CAPTURE = false`, `EARLY_BRIDGE_LEAD_MS = 250`.
+
+### What was kept untouched
+
+`useParams`/`useSearchParams`, `api.getAmbientDisplay`, `api.publishPlaylist`, `fetchData` polling, `applyPendingIfNeeded` (semantics unchanged; refactored to deal with new ref set), preview banner, publish button, announcement block, color bar, orientation handling, container sizing, empty-playlist fallback. No backend / API changes. `vite.config.js` unchanged (`target: 'es2018'` stays).
+
+### Verification
+
+- `npm run build` — clean (16 s, 521 kB main bundle; pre-existing chunk-size warning unrelated to this change).
+- Desktop smoke test (acceptance criteria H.1) and on-device Tizen verification (H.2–H.6) per the plan are the next step before merging to production. The smoking-gun signal on Tizen is the presence of `first-frame ct=...` lines for every video swap — these were *never* appearing pre-rewrite.
+
+### Rollback
+
+`git checkout 46c1da0 -- src/pages/AmbientViewerPage.jsx`. Single-file revert. No DB / API / config dependencies were changed.
+
+### What this rewrite explicitly rejected
+
+- Change 8 from the 2026-05-18 escalation note (hidden warm-up `<video>` + `readyState` polling) — same architectural class as the failing code, same Tizen visibility-driven decode suppression.
+- Increasing fallback timers past 1200 ms — treats the symptom, not the cause.
+- User-agent sniffing for Tizen branches — the new architecture is correct on all platforms.
+- Adding a third hidden layer or rotating three videos — worsens decoder contention.
+- `requestVideoFrameCallback` — Chromium-only; absent on Tizen WebKit.
