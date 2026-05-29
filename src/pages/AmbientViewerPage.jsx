@@ -6,11 +6,14 @@ import { toast } from '@/components/ui/sonner';
 const IMAGE_DURATION = 5000;
 const CROSSFADE_DURATION = 500;
 const BRIDGE_FADE_DURATION = 150;
-const SWAP_TIMEOUT_MS = 2000;
+// Tizen's hardware decoder takes ~1400-1900ms to present a video's first frame after src+load().
+// The bridge canvas (video->video) and the held outgoing image (image->video) cover this entire
+// window with real pixels, so a generous timeout has zero visual cost — it just lets the decode
+// complete naturally before any cover is released.
+const SWAP_TIMEOUT_MS = 4000;
 const POLL_INTERVAL = 5000;
 const DECODE_SLOW_THRESHOLD_MS = 800;
 const FRAME_STUCK_WARN_MS = 500;
-const FRAME_STUCK_FATAL_MS = 1500;
 const LOG_RING_SIZE = 30;
 const DEBUG_TICK_MS = 200;
 
@@ -264,7 +267,6 @@ export function AmbientViewerPage() {
     let increments = 0;
     let warnedSlow = false;
     let warnedStuck = false;
-    let triedReload = false;
 
     const tick = () => {
       if (!tokenValid(token)) return;
@@ -301,20 +303,16 @@ export function AmbientViewerPage() {
         warnedSlow = true;
       }
 
-      // Stuck-frame watchdog
+      // Stuck-frame watchdog — DIAGNOSTIC ONLY. We never reload mid-swap: calling load() here would
+      // reset readyState to HAVE_NOTHING and abort the in-flight play() (HTML spec / MDN), throwing
+      // away decode progress and guaranteeing a black reveal when the swap-timeout then fires. The
+      // bridge (or held outgoing image) keeps real pixels on screen while a slow Tizen decode
+      // finishes; the swap-timeout is the only backstop, and genuine media faults are handled by
+      // onError (handleVideoError).
       if (!vid.paused && now - lastCtAtRef.current > FRAME_STUCK_WARN_MS) {
         if (!warnedStuck) {
           logEvent('warn', `frame-stuck rs=${vid.readyState} ns=${vid.networkState} ct=${ct.toFixed(2)}`);
           warnedStuck = true;
-        }
-        if (!triedReload && now - lastCtAtRef.current > FRAME_STUCK_FATAL_MS) {
-          logEvent('error', 'frame-stuck-fatal — reloading');
-          triedReload = true;
-          try {
-            vid.load();
-            const p = vid.play();
-            if (p && typeof p.then === 'function') p.catch(() => {});
-          } catch (_) { /* swallow */ }
         }
       }
 
@@ -393,10 +391,25 @@ export function AmbientViewerPage() {
 
     swapDeadlineRef.current = setTimeout(() => {
       if (!tokenValid(token)) return;
-      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade`);
-      setBridgeOpacity(0, 0);
       if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-      finalizeSwap(token, nextItem, nextIdx);
+      // Tizen-trusted paintability gate (consistent with the D1 first-frame signal): readyState>=2
+      // says a current-position frame exists per spec; currentTime>0 proves the decoder actually
+      // presented and advanced a real frame. Only then is a graceful fade safe — otherwise revealing
+      // the <video> would show black.
+      const paintable = v.readyState >= 2 && v.currentTime > 0;
+      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade (rs=${v.readyState} ct=${v.currentTime.toFixed(2)})`);
+      if (paintable) {
+        logEvent('state', 'video fade start (bridge)');
+        fadeOutBridge(token, () => {
+          logEvent('state', 'video fade end (bridge)');
+          finalizeSwap(token, nextItem, nextIdx);
+        });
+      } else {
+        // Decoder never produced a frame (genuinely broken / too slow) — cut and advance so the
+        // engine never hangs. A black reveal is unavoidable only in this case.
+        setBridgeOpacity(0, 0);
+        finalizeSwap(token, nextItem, nextIdx);
+      }
     }, SWAP_TIMEOUT_MS);
 
     logEvent('lifecycle', 'play() requested');
@@ -585,13 +598,30 @@ export function AmbientViewerPage() {
 
     swapDeadlineRef.current = setTimeout(() => {
       if (!tokenValid(token)) return;
-      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade`);
-      v.style.transition = 'none';
-      v.style.opacity = '1';
-      activeImg.style.transition = 'none';
-      activeImg.style.opacity = '0';
       if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-      finalizeSwap(token, nextItem, nextIdx);
+      // Same Tizen-trusted paintability gate as runVideoToVideo. The outgoing image is still on
+      // screen as the cover, so we only crossfade to the video once it has actually presented a frame.
+      const paintable = v.readyState >= 2 && v.currentTime > 0;
+      logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade (rs=${v.readyState} ct=${v.currentTime.toFixed(2)})`);
+      if (paintable) {
+        logEvent('state', `image fade out [${activeKey}]`);
+        logEvent('state', 'video fade in');
+        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        v.style.opacity = '1';
+        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        activeImg.style.opacity = '0';
+        setTimeout(() => {
+          if (!tokenValid(token)) return;
+          finalizeSwap(token, nextItem, nextIdx);
+        }, CROSSFADE_DURATION);
+      } else {
+        // Decoder never produced a frame — instant reveal + advance so the engine never hangs.
+        v.style.transition = 'none';
+        v.style.opacity = '1';
+        activeImg.style.transition = 'none';
+        activeImg.style.opacity = '0';
+        finalizeSwap(token, nextItem, nextIdx);
+      }
     }, SWAP_TIMEOUT_MS);
 
     logEvent('lifecycle', 'play() requested');

@@ -337,3 +337,117 @@ Deleted functions: `renderLayer(0/1)`, `handleLayerReady`, `handleVideoEnd`, `ha
 - User-agent sniffing for Tizen branches — the new architecture is correct on all platforms.
 - Adding a third hidden layer or rotating three videos — worsens decoder contention.
 - `requestVideoFrameCallback` — Chromium-only; absent on Tizen WebKit.
+
+---
+
+## 2026-05-27 — Fix: remaining black screens (watchdog reload + premature swap-timeout)
+
+**File:** `src/pages/AmbientViewerPage.jsx`
+
+### Symptom
+
+After the 2026-05-26 bridge rewrite, black screens were ~50% reduced but still appeared on a
+**subset** of video swaps — with `Errors: 0`, no media fault, and the bridge architecture otherwise
+working. "Some videos transition fine, some don't" was effectively a coin flip.
+
+### Root cause (confirmed from on-device `?debug=true` logs + HTML spec)
+
+Tizen's hardware decoder presents a video's first frame **~1400–1900 ms** after `src` + `load()`
+(proven by the healthy swaps: `first-frame ... (1473ms)`, `(1555ms)`, `(1398ms)`, `(1665ms)`).
+
+The in-swap watchdog in `startFirstFrameLoop` forced a destructive reload at
+`FRAME_STUCK_FATAL_MS = 1500` — **inside** that normal decode window. The failing chain:
+
+```
+play() requested
+frame-stuck-fatal — reloading        ← 1510ms: vid.load() + vid.play()
+play() rejected: AbortError          ← load() aborts the in-flight play() (HTML spec / MDN)
+swap-timeout (2000ms) — forcing fade  ← setBridgeOpacity(0,0): INSTANT cut
+state: SWAPPING → PLAYING
+loadedmetadata                       ← video only NOW has data, ~600ms AFTER the bridge vanished
+```
+
+Per the HTML spec, `load()` resets `readyState` to `HAVE_NOTHING` and aborts the pending `play()`
+promise with `AbortError`. So the "fatal reload" threw away ~1500 ms of decode progress and
+restarted from zero; the 2000 ms swap-timeout then fired before the *restarted* decode could finish
+and **instantly** cut the bridge, revealing the still-black `<video>`. That gap was the black screen.
+The bridge (outgoing video's real last frame) was working — the reload + premature timeout yanked it
+away before the new frame existed.
+
+### Fix (three surgical changes, no architecture/state changes)
+
+1. **Removed the destructive in-swap reload.** The stuck-frame watchdog in `startFirstFrameLoop` is
+   now diagnostic-only (keeps the `frame-stuck` warn). Deleted the `vid.load() + vid.play()` action,
+   the `triedReload` flag, and the now-unused `FRAME_STUCK_FATAL_MS` constant. The swap-timeout is the
+   single backstop; genuine media faults are still handled by `onError` (`handleVideoError`), so the
+   engine can never permanently stall.
+2. **`SWAP_TIMEOUT_MS` 2000 → 4000.** The bridge canvas (video→video) and the held outgoing image
+   (image→video) cover the entire decode window with real pixels, so the extra headroom has **zero
+   visual cost** and lets Tizen's ~1400–1900 ms (occasionally longer) decode complete naturally.
+3. **Tizen-trusted paintability gate on the swap-timeout cover-release** (in `runVideoToVideo` and
+   `runImageToVideo`). On timeout, only release the cover with a **graceful fade** when
+   `videoRef.readyState >= 2 && videoRef.currentTime > 0` — i.e. the decoder has actually presented and
+   advanced a real frame (consistent with the D1 first-frame signal; `readyState >= 2` alone is the
+   spec signal that a frame *exists* but is distrusted on Tizen). If the decoder never produced a frame
+   (rare/broken media), fall back to the prior instant reveal + advance so the engine never hangs. The
+   `swap-timeout` log line now appends `rs=N ct=N.NN`.
+
+### Validation (web-confirmed)
+
+- HTML spec / MDN: `load()` is destructive (resets `readyState`, aborts `play()` with `AbortError`) —
+  confirms change 1 is spec-correct, not inference.
+- Xibo community (Tizen "black screen between videos"): Tizen has no gapless playback; the black is the
+  container background showing through while the `<video>` has nothing painted — confirms covering the
+  full decode window (changes 2 + 3) is the right approach.
+- Samsung's video-element guide endorses the single reused `<video>` + `src`/`load()`-once-on-`ended`
+  pattern; the second mid-swap `load()` (the removed reload) was the deviation.
+
+### Verification
+
+- `npm run build` — clean.
+- Desktop smoke + on-device Tizen (`?debug=true`): every video swap shows `first-frame ct=...`;
+  `frame-stuck-fatal — reloading` and `play() rejected: AbortError` no longer appear; `swap-timeout`
+  rare/absent (now logs `rs/ct`); `Errors: 0`; no visible black screens across 3+ loops.
+
+### Rollback
+
+`git checkout 3ec4e32 -- src/pages/AmbientViewerPage.jsx`. Single-file revert. No DB / API / config deps.
+
+### STATUS — awaiting on-device verification (session pickup note, 2026-05-28)
+
+The fix above is **implemented and builds clean, but NOT yet committed and NOT yet verified on the
+Tizen panel.** Desktop browsers mask the original symptom (they cache videos in memory), so only
+on-device evidence proves the fix. This note exists so the next session can resume without re-deriving
+context.
+
+**Working tree state when this note was written:**
+- `src/pages/AmbientViewerPage.jsx` — modified (Edits 1–5 in the session log; 4 logical changes:
+  remove `FRAME_STUCK_FATAL_MS` constant, remove `triedReload` flag, remove destructive in-swap
+  `vid.load()+vid.play()` reload, raise `SWAP_TIMEOUT_MS` 2000→4000, add `readyState>=2 && currentTime>0`
+  paintability gate to the swap-timeout in `runVideoToVideo` AND `runImageToVideo`).
+- `changes.md` — this 2026-05-27 entry appended.
+- Baseline commit (rollback target): `3ec4e32`.
+- `npm run build` — passes (522 kB main bundle; only the pre-existing chunk-size warning).
+
+**What to capture on the panel (with `?debug=true`, 3+ full loops):**
+- ✅ `first-frame ct=... (Nms after play)` appears for **every** video swap (the smoking-gun line —
+  was missing on every swap pre-fix).
+- ✅ `frame-stuck-fatal — reloading` — **never** appears (removed).
+- ✅ `play() rejected: AbortError` — **never** appears (was caused by the removed reload).
+- ✅ `swap-timeout (...)` — rare/absent. If it does fire, it now logs `rs=N ct=N.NN`.
+- ✅ HUD shows `Errors: 0`.
+- ✅ No visible black screens on any transition, including at `=== LOOP RESTART (item N → item 0) ===`.
+
+**Failure tells to flag separately:**
+- `swap-timeout (...)` with `ct=0.00` → decoder produced no frame within 4 s → genuinely failing media
+  or a clip needing >4 s to decode on this firmware. Separate follow-up, not this class of bug.
+- Black screens persist **with** `first-frame ct=...` present → different root cause (bridge capture
+  returning black? compositor issue?). Investigate from there, do not revisit Edits 1–5.
+- Black screens persist **without** `first-frame ct=...` → the rAF first-frame detection itself isn't
+  firing on this firmware; escalate to a different first-frame signal.
+
+**Next session actions, in order:**
+1. Read this note + the 2026-05-27 entry above (full context).
+2. Ask the user for the HUD photos taken on the panel.
+3. If healthy → commit both files in one commit referencing the root cause; offer to push.
+4. If unhealthy → match the symptom against the failure-tells above and branch from there.
