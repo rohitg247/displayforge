@@ -653,3 +653,30 @@ bundled here to keep this patch small and infra-free.
 Verify: `curl -I http://<backend>/uploads/<file>` shows `Cache-Control: public, max-age=31536000,
 immutable` and `Accept-Ranges: bytes`. Rollback: revert `server/main.py` (mount `StaticFiles`
 directly again); purely additive, no data impact.
+
+---
+
+## Deferred follow-up (NOT in this rollout) — replace `vite preview` with a real static server
+
+**Status:** documented only, intentionally deferred. Test the current Tizen black-screen fix +
+`/uploads` cache hardening on the panel first; revisit this afterward to keep the rollout small and
+isolate variables. **No code in this pass.**
+
+**Why:** production serves the built frontend with `npm run preview` (`Dockerfile.frontend` CMD), and
+`vite.config.js`'s `preview.proxy` forwards `/uploads` + `/api` to the backend. Vite's docs state
+`preview` is not intended for production serving; its single-process Node proxy isn't tuned for large
+media or many HTTP range requests.
+
+**When ready, do (separate change):**
+1. **Serve `dist/` from nginx** (or another real static server) instead of `vite preview`. Make
+   `Dockerfile.frontend` multi-stage (node build → nginx serve) and update the `frontend` service in
+   `docker-compose.yml`.
+2. **Serve `/uploads` directly** from the backend (or nginx reverse-proxying to it) with HTTP
+   **range** support and the **cache headers already added** (`Cache-Control: public,
+   max-age=31536000, immutable`, `Accept-Ranges: bytes`) — i.e. don't route media through a JS preview
+   proxy.
+3. **Route `/api`** to the backend via nginx `proxy_pass`, or keep the browser hitting the backend
+   directly via `VITE_API_URL`.
+
+**Acceptance:** media loads with correct `Cache-Control` + `206` range responses; zero change to the
+playback engine; `?debug` HUD timings unchanged or better.
