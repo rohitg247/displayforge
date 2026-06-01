@@ -22,4 +22,7 @@ const Toaster = ({ ...props }) => {
   );
 };
 
+// `toast` is re-exported alongside the Toaster component by design (shadcn pattern, imported
+// app-wide). This only affects React Fast Refresh in dev — no production impact.
+// eslint-disable-next-line react-refresh/only-export-components
 export { Toaster, toast };

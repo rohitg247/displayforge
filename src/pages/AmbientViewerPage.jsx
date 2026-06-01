@@ -14,7 +14,7 @@ const SWAP_TIMEOUT_MS = 4000;
 const POLL_INTERVAL = 5000;
 const DECODE_SLOW_THRESHOLD_MS = 800;
 const FRAME_STUCK_WARN_MS = 500;
-const LOG_RING_SIZE = 30;
+const LOG_RING_SIZE = 60;
 const DEBUG_TICK_MS = 200;
 
 // D2 contingency knob. Only flip to true after on-device evidence that the
@@ -62,6 +62,7 @@ export function AmbientViewerPage() {
   const videoRef = useRef(null);
   const imageARef = useRef(null);
   const imageBRef = useRef(null);
+  const posterRef = useRef(null);        // server-generated last-frame cover for video->video swaps
   const bridgeCanvasRef = useRef(null);
   const bridgeCtxRef = useRef(null);
 
@@ -161,13 +162,33 @@ export function AmbientViewerPage() {
     if (canvas.height !== h) canvas.height = h;
     try {
       ctx.drawImage(v, 0, 0, w, h);
+      // DIAGNOSTIC (debug-only, zero cost in production): sample a few pixels and log mean luma.
+      // Distinguishes a real captured frame (luma > 0) from a black/transparent capture (luma ~0) —
+      // the signature of Tizen suppressing drawImage of a hardware-decoded video. Video is
+      // same-origin (/uploads/...), so getImageData does not taint/throw; guarded regardless.
+      if (isDebug) {
+        try {
+          const samples = [[w >> 1, h >> 1], [w >> 2, h >> 2], [(w * 3) >> 2, (h * 3) >> 2]];
+          let lumaSum = 0, alphaSum = 0;
+          for (const [sx, sy] of samples) {
+            const d = ctx.getImageData(sx, sy, 1, 1).data;
+            lumaSum += 0.299 * d[0] + 0.587 * d[1] + 0.114 * d[2];
+            alphaSum += d[3];
+          }
+          const luma = Math.round(lumaSum / samples.length);
+          const alpha = Math.round(alphaSum / samples.length);
+          logEvent(luma <= 2 ? 'warn' : 'success', `bridge px luma=${luma} a=${alpha}`);
+        } catch (probeErr) {
+          logEvent('warn', `bridge px probe-failed: ${probeErr?.name ?? 'Error'}`);
+        }
+      }
       logEvent('state', `bridge on (${w}x${h})`);
       return true;
     } catch (err) {
       logEvent('warn', `bridge-capture-failed: ${err?.name ?? 'Error'}`);
       return false;
     }
-  }, [logEvent]);
+  }, [logEvent, isDebug]);
 
   const setBridgeOpacity = useCallback((value, transitionMs) => {
     const el = bridgeCanvasRef.current;
@@ -205,6 +226,24 @@ export function AmbientViewerPage() {
       });
     prefetchRef.current.set(url, promise);
   }, [logEvent]);
+
+  /* ----------------------------- POSTER PRELOAD ----------------------------- */
+
+  // Decode the *currently playing* video's last-frame poster into the hidden poster <img> well
+  // before it ends, so a video->video swap can raise it as an instant, real-pixel cover. No-op for
+  // images or videos without a server-generated poster (those fall back to the canvas bridge).
+  const preloadPoster = useCallback((item) => {
+    const img = posterRef.current;
+    if (!img) return;
+    const url = (item && item.media_type === 'video' && item.poster_path) ? item.poster_path : null;
+    if (!url) { img.dataset.url = ''; return; }
+    if (img.dataset.url === url) return; // already (pre)loaded this poster
+    img.style.transition = 'none';
+    img.style.opacity = '0';
+    img.dataset.url = url;
+    img.src = url;
+    if (isDebug) logEvent('lifecycle', `poster preload ${basename(url)}`);
+  }, [logEvent, isDebug]);
 
   /* ----------------------------- FETCH (POLLING) ---------------------------- */
 
@@ -348,8 +387,10 @@ export function AmbientViewerPage() {
     if (mediaRef.current.length > 1) {
       startPrefetch(mediaRef.current[nextNextIdx]);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch]);
+
+    // Decode the now-current video's last-frame poster so the next video->video swap can use it.
+    preloadPoster(mediaRef.current[currentIdxRef.current]);
+  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch, preloadPoster]);
 
   /* ---------------------------- TRANSITION CASES ---------------------------- */
 
@@ -380,8 +421,79 @@ export function AmbientViewerPage() {
     swapStartAtRef.current = performance.now();
     goState(STATE_SWAPPING);
 
-    captureBridge();
-    setBridgeOpacity(1, 0);
+    // ---- Choose the cover that holds the outgoing last frame during the incoming clip's decode ----
+    //   poster <img>   : server-generated last frame. A real <img> always paints on Tizen and is
+    //                    immune to both the hardware-overlay z-index issue and drawImage-black.
+    //   canvas bridge  : runtime drawImage capture (fallback for media without a poster). May be
+    //                    black on some Tizen firmware — that's exactly what the luma probe detects.
+    //   cut            : no cover available — one black gap, no worse than a raw swap.
+    const outgoingItem = mediaRef.current[currentIdxRef.current];
+    const posterUrl = outgoingItem?.poster_path || null;
+    const posterImg = posterRef.current;
+    const posterReady = !!posterImg && posterImg.dataset.url === posterUrl
+      && posterImg.complete && posterImg.naturalWidth > 0;
+
+    let coverMode;
+    if (posterReady) {
+      posterImg.style.transition = 'none';
+      posterImg.style.opacity = '1';
+      coverMode = 'poster';
+      logEvent('state', 'cover: poster (last frame)');
+    } else {
+      const captured = captureBridge();
+      if (captured) {
+        setBridgeOpacity(1, 0);
+        coverMode = 'bridge';
+        logEvent('state', posterUrl ? 'cover: bridge (poster not ready)' : 'cover: bridge');
+      } else {
+        coverMode = 'cut';
+        logEvent('warn', 'cover: none — cut');
+      }
+    }
+
+    // Hide the about-to-blank <video> plane behind the cover. On Tizen the hardware video plane can
+    // composite above HTML layers (ignoring z-index), so a blanked-but-visible <video> shows black
+    // over the cover; opacity:0 reliably hides it (proven by the image->video path). Only hide when
+    // we actually have a cover — a cut leaves the video visible (no worse than today).
+    if (coverMode !== 'cut') {
+      v.style.transition = 'none';
+      v.style.opacity = '0';
+      logEvent('lifecycle', 'video hidden (cover up)');
+    }
+
+    const revealVideo = (label) => {
+      v.style.transition = 'none';
+      v.style.opacity = '1';
+      logEvent('lifecycle', label);
+    };
+
+    // Crossfade the cover out over the now-revealed live video, then finalize.
+    const lowerCover = (onDone) => {
+      const elapsed = Math.round(performance.now() - swapStartAtRef.current);
+      if (coverMode === 'poster' && posterImg) {
+        posterImg.style.transition = `opacity ${BRIDGE_FADE_DURATION}ms linear`;
+        posterImg.style.opacity = '0';
+        setTimeout(() => {
+          posterImg.style.transition = 'none';
+          if (!tokenValid(token)) return;
+          logEvent('state', `cover off (poster, ${elapsed}ms after swap)`);
+          onDone();
+        }, BRIDGE_FADE_DURATION + 40);
+      } else if (coverMode === 'bridge') {
+        fadeOutBridge(token, onDone);
+      } else {
+        onDone();
+      }
+    };
+
+    const forceCoverOff = () => {
+      if (coverMode === 'poster' && posterImg) {
+        posterImg.style.transition = 'none';
+        posterImg.style.opacity = '0';
+      } else if (coverMode === 'bridge') {
+        setBridgeOpacity(0, 0);
+      }
+    };
 
     const url = nextItem.file_path;
     logEvent('lifecycle', `src-set ${basename(url)}`);
@@ -399,15 +511,17 @@ export function AmbientViewerPage() {
       const paintable = v.readyState >= 2 && v.currentTime > 0;
       logEvent('error', `swap-timeout (${SWAP_TIMEOUT_MS}ms) — forcing fade (rs=${v.readyState} ct=${v.currentTime.toFixed(2)})`);
       if (paintable) {
-        logEvent('state', 'video fade start (bridge)');
-        fadeOutBridge(token, () => {
-          logEvent('state', 'video fade end (bridge)');
+        revealVideo('video shown');
+        logEvent('state', 'video fade start (cover)');
+        lowerCover(() => {
+          logEvent('state', 'video fade end (cover)');
           finalizeSwap(token, nextItem, nextIdx);
         });
       } else {
-        // Decoder never produced a frame (genuinely broken / too slow) — cut and advance so the
-        // engine never hangs. A black reveal is unavoidable only in this case.
-        setBridgeOpacity(0, 0);
+        // Decoder never produced a frame (genuinely broken / too slow) — reveal whatever the video
+        // has and cut so the engine never hangs. A black reveal is unavoidable only in this case.
+        revealVideo('video shown (forced)');
+        forceCoverOff();
         finalizeSwap(token, nextItem, nextIdx);
       }
     }, SWAP_TIMEOUT_MS);
@@ -423,9 +537,12 @@ export function AmbientViewerPage() {
     startFirstFrameLoop(token, () => {
       if (swapDeadlineRef.current) { clearTimeout(swapDeadlineRef.current); swapDeadlineRef.current = null; }
       if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
-      logEvent('state', 'video fade start (bridge)');
-      fadeOutBridge(token, () => {
-        logEvent('state', 'video fade end (bridge)');
+      // Reveal the live video underneath, then fade the cover out over it (true crossfade from the
+      // held last frame to the next clip).
+      revealVideo('video shown');
+      logEvent('state', 'video fade start (cover)');
+      lowerCover(() => {
+        logEvent('state', 'video fade end (cover)');
         finalizeSwap(token, nextItem, nextIdx);
       });
     });
@@ -682,7 +799,6 @@ export function AmbientViewerPage() {
     else if (fromType === 'image' && toType === 'image') runImageToImage(nextItem, nextIdx);
     else if (fromType === 'image' && toType === 'video') runImageToVideo(nextItem, nextIdx);
     else logEvent('error', `unknown transition kind: ${fromType}→${toType}`);
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [logEvent, runVideoToVideo, runVideoToImage, runImageToImage, runImageToVideo]);
 
   function armImageTimer(durationMs = IMAGE_DURATION) {
@@ -737,7 +853,10 @@ export function AmbientViewerPage() {
       const nextIdx = (currentIdxRef.current + 1) % mediaRef.current.length;
       startPrefetch(mediaRef.current[nextIdx]);
     }
-  }, [bumpToken, goState, logEvent, startPrefetch]);
+
+    // Decode this item's last-frame poster (if a video) so its first swap can use it as a cover.
+    preloadPoster(item);
+  }, [bumpToken, goState, logEvent, startPrefetch, preloadPoster]);
 
   /* ----------------------------- AUTOSTART EFFECT --------------------------- */
 
@@ -796,11 +915,10 @@ export function AmbientViewerPage() {
     const msg = v?.error?.message ?? '';
     errorCountRef.current += 1;
     logEvent('error', `onError name=${code} msg=${msg}`);
-    if (stateRef.current === STATE_SWAPPING && swapDeadlineRef.current) {
-      // Fast-fail the swap
-      clearTimeout(swapDeadlineRef.current);
-      swapDeadlineRef.current = setTimeout(() => {}, 0);
-    }
+    // Do NOT touch swapDeadlineRef here. The previous code cleared the real swap-timeout and replaced
+    // it with an empty setTimeout(() => {}, 0) — destroying the only backstop, so a corrupt/missing
+    // video mid-swap hung the engine forever. Leaving the swap-timeout armed lets it fire and advance
+    // (its not-paintable branch reveals the video + finalizes), so the engine always recovers.
   }, [logEvent]);
 
   const handleVideoPlaying = useCallback(() => { logEvent('lifecycle', 'playing event'); checkRsNsDelta(); }, [logEvent, checkRsNsDelta]);
@@ -954,6 +1072,8 @@ export function AmbientViewerPage() {
             willChange: 'opacity',
           }}
         />
+        {/* Last-frame poster cover for video->video swaps (z=3, above the canvas at equal z). */}
+        <img ref={posterRef} alt="" style={layerStyle(3)} />
 
         {isDebug && (
           <div
@@ -965,6 +1085,8 @@ export function AmbientViewerPage() {
               pointerEvents: 'none',
               padding: '6px 8px',
               maxWidth: 'min(46vw, 520px)',
+              maxHeight: '96vh',
+              overflow: 'hidden',
               background: 'rgba(0,0,0,0.85)',
               color: '#0f0',
               fontFamily: 'monospace',
@@ -988,7 +1110,7 @@ export function AmbientViewerPage() {
                 key={i}
                 style={{
                   color: COLOR_BY_CLASS[e.klass] || '#ddd',
-                  opacity: Math.max(0.25, 1 - i * 0.025),
+                  opacity: Math.max(0.3, 1 - i * 0.012),
                   whiteSpace: 'nowrap',
                   overflow: 'hidden',
                   textOverflow: 'ellipsis',

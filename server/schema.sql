@@ -52,6 +52,7 @@ CREATE TABLE IF NOT EXISTS ambient_media (
     playlist            TEXT    NOT NULL DEFAULT 'A',
     sort_order          INTEGER NOT NULL DEFAULT 0,
     status              TEXT    NOT NULL DEFAULT 'draft',
+    poster_path         TEXT    DEFAULT NULL,
     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 

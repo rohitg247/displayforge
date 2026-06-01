@@ -27,5 +27,16 @@ def init_db():
     conn = get_db()
     schema_path = Path(__file__).parent / "schema.sql"
     conn.executescript(schema_path.read_text())
+
+    # Idempotent column adds for existing production databases (schema.sql's CREATE TABLE
+    # IF NOT EXISTS never alters an existing table). Safe to run on every startup.
+    for stmt in (
+        "ALTER TABLE ambient_media ADD COLUMN poster_path TEXT DEFAULT NULL",
+    ):
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+
     conn.commit()
     conn.close()

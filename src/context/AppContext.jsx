@@ -179,6 +179,9 @@ export function AppProvider({ children }) {
   );
 }
 
+// Co-locating the `useApp` hook with its provider is the standard Context pattern; this is a
+// dev-only Fast Refresh hint with no production impact.
+// eslint-disable-next-line react-refresh/only-export-components
 export function useApp() {
   const context = useContext(AppContext);
   if (!context) throw new Error('useApp must be used within AppProvider');

@@ -12,8 +12,9 @@ from ..models import (
     AmbientMediaOut,
     MediaReorderRequest,
     ActivePlaylistRequest,
-    PublishPlaylistRequest,     
+    PublishPlaylistRequest,
 )
+from ..media_utils import extract_last_frame
 
 router = APIRouter()
 
@@ -89,7 +90,7 @@ def get_ambient_display(
 
     if playlist and playlist in ("A", "B"):
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status
+            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path
                 FROM ambient_media
                 WHERE ambient_display_id = ? AND playlist = ? {status_filter}
                 ORDER BY sort_order, id""",
@@ -97,7 +98,7 @@ def get_ambient_display(
         ).fetchall()
     else:
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status
+            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path
                 FROM ambient_media
                 WHERE ambient_display_id = ? {status_filter}
                 ORDER BY sort_order, id""",
@@ -231,12 +232,16 @@ def delete_ambient_display(
         raise HTTPException(status_code=404, detail="Ambient display not found")
 
     media_rows = db.execute(
-        "SELECT file_path FROM ambient_media WHERE ambient_display_id = ?", (display_id,)
+        "SELECT file_path, poster_path FROM ambient_media WHERE ambient_display_id = ?", (display_id,)
     ).fetchall()
     for m in media_rows:
         filepath = Path(settings.UPLOAD_DIR) / Path(m["file_path"]).name
         if filepath.exists():
             filepath.unlink()
+        if m["poster_path"]:
+            poster = Path(settings.UPLOAD_DIR) / Path(m["poster_path"]).name
+            if poster.exists():
+                poster.unlink()
 
     db.execute("DELETE FROM ambient_displays WHERE id = ?", (display_id,))
     db.commit()
@@ -285,10 +290,19 @@ def upload_ambient_media(
         filepath = upload_dir / filename
         filepath.write_bytes(content)
 
+        # For videos, extract a last-frame poster so the Tizen viewer can hold the final frame on
+        # screen during the next clip's decode (no black gap). Best-effort: if ffmpeg is missing or
+        # fails, poster_path stays NULL and the viewer falls back to its canvas bridge.
+        poster_path = None
+        if media_type == "video":
+            poster_filename = f"{Path(filename).stem}-poster.jpg"
+            if extract_last_frame(filepath, upload_dir / poster_filename):
+                poster_path = f"/uploads/{poster_filename}"
+
         sort_order = max_order + 1 + i
         cursor = db.execute(
-            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order) VALUES (?, ?, ?, ?, ?)",
-            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order),
+            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order, poster_path) VALUES (?, ?, ?, ?, ?, ?)",
+            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order, poster_path),
         )
         db.commit()
         uploaded.append({
@@ -299,6 +313,7 @@ def upload_ambient_media(
             "playlist": playlist,
             "sort_order": sort_order,
             "status": "draft",
+            "poster_path": poster_path,
         })
 
     return {"media": uploaded}
@@ -333,6 +348,11 @@ def delete_ambient_media(
     filepath = Path(settings.UPLOAD_DIR) / Path(media["file_path"]).name
     if filepath.exists():
         filepath.unlink()
+
+    if media["poster_path"]:
+        poster = Path(settings.UPLOAD_DIR) / Path(media["poster_path"]).name
+        if poster.exists():
+            poster.unlink()
 
     db.execute("DELETE FROM ambient_media WHERE id = ?", (media_id,))
     db.commit()

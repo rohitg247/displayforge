@@ -58,6 +58,11 @@ export function CaseStudyEditorPage() {
     if (latestSelected) {
       handleSelectCaseStudy(latestSelected);
     }
+    // Intentionally fires only when the caseStudies list changes: it (re)selects a valid case study
+    // and syncs the selected one to latest data. `editingId` is read but must NOT be a trigger
+    // (re-running on every selection would reset the form), and `handleSelectCaseStudy` is recreated
+    // each render (adding it would cause an infinite loop). Deps stay [caseStudies] by design.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [caseStudies]);
 
   const handleSelectCaseStudy = (cs) => {

@@ -451,3 +451,165 @@ context.
 2. Ask the user for the HUD photos taken on the panel.
 3. If healthy → commit both files in one commit referencing the root cause; offer to push.
 4. If unhealthy → match the symptom against the failure-tells above and branch from there.
+
+---
+
+## 2026-06-01 — Root-cause fix: video→video black screens (visible blanked plane) + last-frame poster cover
+
+**Files:** `src/pages/AmbientViewerPage.jsx`, `server/media_utils.py` (new),
+`server/backfill_posters.py` (new), `server/routers/ambient_router.py`, `server/models.py`,
+`server/schema.sql`, `server/database.py`, `migrate.py`, `Dockerfile.backend`.
+
+### Symptom (still present after the 2026-05-27 fix)
+Black screens on a subset of **video→video** swaps (notably the loop boundary item N → item 0), with
+`Errors: 0`, `first-frame` arriving normally (~1.7 s), and the HUD showing `BRIDGE: on`. So the
+bridge was "up" yet the screen was black during the incoming clip's decode window.
+
+### Root cause (confirmed from logs + code path, ranked)
+The black is visible **during decode while the bridge is on**, which means the canvas bridge is not
+actually covering the panel. Decisive contrast in the on-device logs:
+- **image→video never blacks** — `runImageToVideo` sets `v.style.opacity='0'` *before* `load()`/`play()`.
+- **video→video blacks** — `runVideoToVideo` left the `<video>` at `opacity:1` for the whole decode
+  window, with only the canvas as cover.
+
+The factor that correlates with black is **"the blanked `<video>` is left visible during decode."**
+On Tizen the hardware video plane composites above HTML / ignores z-index (hypothesis **B**, best
+fit), so the blanked plane shows over the canvas. A secondary possibility is that
+`drawImage(hardware-decoded video)` writes black pixels (hypothesis **A**). `bridge on (WxH)` only
+proves `drawImage` didn't throw, not that the pixels are real. External refs: signageOS / Xibo /
+NowSignage / Signagelive / Yodeck all confirm HTML5 `<video>` on Tizen is **not gapless** (black
+between clips is the platform default; true gapless needs native `webapis.avplay` in a packaged app);
+Chromium's tracker documents `drawImage(video)` returning black with HW-accelerated video.
+
+The 2026-05-27 fix (no in-swap reload, `SWAP_TIMEOUT_MS=4000`, paintability-gated release) was
+correct and is **kept untouched** — it solved a *different* black-screen class. It just wasn't the
+whole story.
+
+### Fix — Phase 1 (client, `AmbientViewerPage.jsx`)
+1. **Hide the video plane during the decode gap.** `runVideoToVideo` now raises a cover, then sets
+   `v.style.opacity='0'` *before* `v.src=…/load()`, and reveals (`opacity='1'`) **before** the cover
+   is lowered — in the `first-frame` path **and** the timeout-paintable path (and a forced reveal on
+   the not-paintable path). opacity:0 reliably hides the plane on this panel (proven by image→video).
+2. **Cover ladder (fallback order): poster `<img>` → canvas bridge → instant cut.** The video is only
+   hidden when a real cover exists (a cut leaves it visible — no worse than before).
+3. **Debug-only luma probe in `captureBridge`** (gated behind `isDebug`, zero production cost):
+   `getImageData` of a few pixels → `bridge px luma=NN a=NN`. From a phone photo this tells us
+   whether the canvas held a real frame (B) or black (A). Same-origin video ⇒ no taint.
+4. **Latent stall bug fixed:** `handleVideoError` previously cleared the swap-timeout and replaced it
+   with `setTimeout(()=>{},0)` — a media error mid-swap hung the engine forever. It now leaves the
+   swap-timeout armed (its not-paintable branch reveals + finalizes), so the engine always recovers.
+5. **Diagnostics:** `LOG_RING_SIZE` 30→60; HUD `maxHeight:'96vh'` + `overflow:hidden`; softer
+   per-line opacity fade. New vocabulary: `cover: poster|bridge|none`, `video hidden (cover up)`,
+   `video shown`, `cover off (…)`, `bridge px luma=…`, `poster preload …`. Existing vocabulary kept.
+6. New `posterRef` `<img>` layer (z=3, above the canvas at equal z) + `preloadPoster(item)` which
+   decodes the *currently playing* video's poster into that `<img>` (called from `start` and
+   `finalizeSwap`) so a swap can raise it instantly.
+
+**Not changed (per design):** `SWAP_TIMEOUT_MS`, the swap-token system, the rAF `currentTime>0`×2
+first-frame gate — all correct.
+
+### Fix — Phase 2 (server-side last-frame poster; the definitive cover)
+A real `<img>` always paints on Tizen and is immune to both the overlay z-index issue and
+drawImage-black, so we pre-generate each video's last frame and show it as the cover.
+
+- **`server/media_utils.py` (new):** `extract_last_frame(video, poster)` shells out to ffmpeg —
+  `-sseof -0.2` (frame ~0.2 s before end), retrying `-ss 00:00:00` (first frame) for very short
+  clips. Never raises; returns False if ffmpeg is missing/fails (viewer falls back to the bridge).
+  `ffmpeg_available()` helper.
+- **`server/routers/ambient_router.py`:** on video upload, generate `…-poster.jpg` and store
+  `poster_path`; return it from `get_ambient_display` (added to both SELECTs); delete the poster file
+  in both delete endpoints.
+- **`server/models.py`:** `AmbientMediaOut.poster_path: Optional[str]`.
+- **`server/schema.sql`:** `poster_path TEXT DEFAULT NULL` on `ambient_media` (fresh installs).
+- **`server/database.py`:** idempotent `ALTER TABLE ambient_media ADD COLUMN poster_path` in
+  `init_db()` — existing **production** DBs pick up the column automatically on deploy.
+- **`migrate.py`:** same ALTER added (local dev).
+- **`Dockerfile.backend`:** `ffmpeg` added to the existing `apt-get install` line (backend image
+  only — no frontend bundle / host impact; Tizen browser does *less* work, not more).
+- **`server/backfill_posters.py` (new):** idempotent backfill for already-uploaded videos. Run
+  `python -m server.backfill_posters` (root or inside the backend container). Skips rows with
+  `poster_path` set, reuses an existing poster file, only invokes ffmpeg for the rest.
+
+`src/services/api.js` needs no change — `poster_path` flows through `getAmbientDisplay` automatically.
+
+### Deploy
+1. Rebuild the backend image (`docker compose build backend` / `up -d --build`) so ffmpeg is present
+   and `init_db()` adds the column.
+2. One-time: `docker compose exec backend python -m server.backfill_posters` to poster existing
+   videos. New uploads get posters automatically.
+3. Frontend: `npm run build` (clean — 523 kB main bundle, only the pre-existing chunk-size warning).
+
+### Verification (Tizen panel, `?debug=true`, mixed playlist, 3+ loops, photograph HUD)
+- **No black** on any video→video swap incl. `=== LOOP RESTART (item N → item 0) ===`; the outgoing
+  last frame holds, then crossfades to the next clip.
+- `cover: poster (last frame)` on swaps with a poster; `video hidden (cover up)` → `video shown`
+  bracket each swap; `cover off (poster …)`.
+- `bridge px luma=NN` (debug): `luma>0` ⇒ cause was B (video-hide fixed it); `luma≈0` ⇒ cause was A
+  (poster is what's covering). Either way the poster guarantees the freeze-frame.
+- `first-frame ct=…` every swap; `swap-timeout` rare/absent; `Errors: 0`.
+- First clip on cold start may still flash black once (platform first-loop limit) — expected.
+
+### What this rejected
+- npm libraries to "fix" Tizen compositing — none exist; would only grow the bundle.
+- Browser-side last-frame capture on the panel — Tizen browser is resource-limited; all heavy work is
+  server-side now.
+- Native `webapis.avplay` — the only true-gapless path on Tizen, but requires repackaging as a
+  privileged `.wgt` app; out of scope (documented as the strategic option).
+
+### Rollback
+Frontend: `git checkout 503daa2 -- src/pages/AmbientViewerPage.jsx`. Backend is additive (nullable
+column + best-effort ffmpeg); reverting the router/Docker changes leaves existing data intact.
+
+---
+
+## 2026-06-01 — ESLint now covers `.js` / `.jsx` (was TS-only)
+
+**Files:** `eslint.config.js`, `src/pages/AmbientViewerPage.jsx`.
+
+### Why
+The flat config linted only `files: ["**/*.{ts,tsx}"]`. Since the entire app is `.js`/`.jsx` (there
+are **no** `.ts`/`.tsx` source files), ESLint silently skipped every real file — `npx eslint
+src/pages/AmbientViewerPage.jsx` returned "File ignored because no matching configuration was
+supplied". So `react-hooks/rules-of-hooks`, `react-hooks/exhaustive-deps`, and base JS rules never ran
+on the React sources (which is also how a bogus "tagged-template" bug report could even be
+entertained). TypeScript-ESLint is **kept** (zero-risk, ready for future `.ts`/`.tsx` scaling) — its
+parser handles JS fine and its rules are inert on plain JS.
+
+### Changes — `eslint.config.js`
+- **Glob widened:** `files: ["**/*.{ts,tsx}"]` → `["**/*.{ts,tsx,js,jsx}"]`.
+- **Ignores tightened:** `["dist"]` → `["dist", "**/*.config.js", "**/*copy*.jsx", "**/*_REFERENCE.jsx"]`.
+  - `**/*.config.js` — Node-context build configs (`vite/vitest/tailwind/postcss/eslint.config.js`)
+    use `process` / `__dirname` / `require`, which would trip `no-undef` under browser globals; they
+    aren't app source.
+  - `**/*copy*.jsx`, `**/*_REFERENCE.jsx` — dead backup copies of AmbientViewerPage.
+- **`"no-empty": ["error", { allowEmptyCatch: true }]`** added — the code uses intentional best-effort
+  `catch (_) {}` cleanups (e.g. `video.pause()`), so empty catches shouldn't fail lint.
+
+### Changes — `src/pages/AmbientViewerPage.jsx`
+Removed 2 now-dead `// eslint-disable-next-line react-hooks/exhaustive-deps` directives (in
+`finalizeSwap` and `advance`). With the file finally being linted, ESLint reported them as **unused**
+— the dependency arrays are already complete for reactive values (the omitted items are refs /
+hoisted function declarations the rule ignores), so the disables were unnecessary.
+
+### Pre-existing warnings surfaced — all resolved (production-friendly pass)
+Widening the glob surfaced 3 warnings in files outside the ambient viewer. All resolved correctly:
+- **`src/components/ui/sonner.jsx`** & **`src/context/AppContext.jsx`** —
+  `react-refresh/only-export-components`. Both are intentional, idiomatic patterns (shadcn re-exports
+  `toast` next to `Toaster`; the Context file co-locates `useApp` with `AppProvider`). The rule is a
+  **dev-only Fast Refresh** hint with no production impact, and splitting the files would ripple
+  through many imports — so each got a targeted `// eslint-disable-next-line
+  react-refresh/only-export-components` with a justification comment.
+- **`src/pages/CaseStudyEditorPage.jsx:61`** — `exhaustive-deps` "missing `editingId`". This effect
+  **must** run only on `caseStudies` change. Adding `editingId` would reset the form on every
+  selection, and adding `handleSelectCaseStudy` (recreated each render) would cause an infinite loop —
+  so blindly adding the dep was a real bug. Resolved with a documented `eslint-disable-next-line`
+  explaining the intentional partial deps.
+
+### Result
+- `npm run lint` → **0 problems** (0 errors, 0 warnings) across the whole project.
+- `AmbientViewerPage.jsx` lints **completely clean** (validates the black-screen work's hook deps).
+- `npm run build` — clean (config + comment-only; no runtime impact).
+
+### Optional follow-up
+To lint the config files too, add a block targeting `**/*.config.js` with
+`languageOptions.globals: globals.node` instead of ignoring them.

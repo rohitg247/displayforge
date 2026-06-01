@@ -118,6 +118,7 @@ class AmbientMediaOut(BaseModel):
     playlist: str = "A"
     sort_order: int
     status: str = "draft"          # ← add this line
+    poster_path: Optional[str] = None   # last-frame JPEG for video->video swap cover
 
 
 class PublishPlaylistRequest(BaseModel):     # ← add entire new class
