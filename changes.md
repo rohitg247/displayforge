@@ -613,3 +613,43 @@ Widening the glob surfaced 3 warnings in files outside the ambient viewer. All r
 ### Optional follow-up
 To lint the config files too, add a block targeting `**/*.config.js` with
 `languageOptions.globals: globals.node` instead of ignoring them.
+
+---
+
+## 2026-06-01 — Hardening: `Cache-Control` for `/uploads` static media
+
+**File:** `server/main.py`. **Scope:** network hardening only — **no playback logic changed.**
+
+### Why
+Not a fix for the transition delay (that's Tizen decode/compositor-side, not the JSON API poll). This
+just stops the request layer from adding avoidable network cost: `StaticFiles` sends
+`ETag`/`Last-Modified`/`Accept-Ranges` but **no `Cache-Control`**, so the Tizen browser re-requests
+the same video over the network on **every playlist loop** instead of serving it from cache.
+
+### Change
+Added a `CachedStaticFiles(StaticFiles)` subclass that overrides `file_response` to set
+`Cache-Control: public, max-age=31536000, immutable`, and mounted `/uploads` with it.
+
+`immutable` is safe here because every uploaded filename is unique/timestamped and never overwritten
+in place — `ambient-<id>-<ts>-<i>.<ext>`, `<stem>-poster.jpg`, `cs-<id>-thumb-<i>-<ts>.<ext>` — so a
+given URL's bytes never change. A given media URL deleted + re-uploaded gets a new name, so stale
+cache entries can't collide. Verified `Starlette.StaticFiles.file_response` exists and is synchronous,
+so the override is correct; it applies to both full (200) and range (206) responses.
+
+### Effect
+Loop replays and the new poster `<img>`s load from the browser cache instead of re-downloading; the
+HTTP-cache prefetch (`fetch(..., {cache:'force-cache'})`) also becomes effective. No API/route/schema
+change; no frontend change.
+
+### Note (infra, NOT part of this patch) — production currently uses `vite preview`
+`Dockerfile.frontend` serves the built app with `npm run preview` (vite preview) on :3200, and
+`vite.config.js`'s `preview.proxy` forwards `/uploads` (and `/api`) to the backend. Vite's docs state
+`preview` is **not** for production serving — its Node proxy isn't tuned for large media / many range
+requests. Recommendation (separate change): serve the built `dist/` via nginx (or `serve`) and serve
+`/uploads` directly from the backend/nginx with these same cache + range headers. Deliberately **not**
+bundled here to keep this patch small and infra-free.
+
+### Verify / rollback
+Verify: `curl -I http://<backend>/uploads/<file>` shows `Cache-Control: public, max-age=31536000,
+immutable` and `Accept-Ranges: bytes`. Rollback: revert `server/main.py` (mount `StaticFiles`
+directly again); purely additive, no data impact.

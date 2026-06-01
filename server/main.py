@@ -11,6 +11,22 @@ from .routers import auth_router, branches_router, displays_router, case_studies
 import json
 
 
+class CachedStaticFiles(StaticFiles):
+    """Serve uploaded media with a long-lived, immutable Cache-Control.
+
+    Safe to mark immutable because every uploaded file has a unique, timestamped name
+    (ambient-<id>-<ts>-<i>.<ext>, <stem>-poster.jpg, cs-<id>-thumb-<i>-<ts>.<ext>) and is never
+    overwritten in place — a given URL's bytes never change. This lets the Tizen browser cache
+    videos/posters across playlist loops instead of re-fetching every cycle. (The request layer is
+    not the cause of the transition delay; this just keeps it from adding any network cost.)
+    """
+
+    def file_response(self, *args, **kwargs):
+        response = super().file_response(*args, **kwargs)
+        response.headers["Cache-Control"] = "public, max-age=31536000, immutable"
+        return response
+
+
 def backup_db():
     """Rotate backups before startup: signage.db → .bak1 → .bak2. Keeps last 2 backups."""
     db_path = Path(settings.DATABASE_PATH)
@@ -129,7 +145,7 @@ app.add_middleware(
 
 # Create upload dir before StaticFiles checks for it (needed for named volumes on fresh start)
 Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
-app.mount("/uploads", StaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
+app.mount("/uploads", CachedStaticFiles(directory=settings.UPLOAD_DIR), name="uploads")
 
 app.include_router(auth_router.router, prefix="/api/auth", tags=["auth"])
 app.include_router(branches_router.router, prefix="/api/branches", tags=["branches"])
