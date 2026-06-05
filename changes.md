@@ -680,3 +680,159 @@ media or many HTTP range requests.
 
 **Acceptance:** media loads with correct `Cache-Control` + `206` range responses; zero change to the
 playback engine; `?debug` HUD timings unchanged or better.
+
+---
+
+## 2026-06-02 — On-device follow-up: poster cover confirmed inactive, version stamp + decode normalization
+
+### What the on-device logs proved (root cause, second pass)
+With the previous fix deployed, the panel still showed a brief black on video→video swaps. The new
+`?debug` HUD logs gave the answer directly — every swap logged:
+
+```
+cover: bridge
+bridge on (1040x1854)
+bridge px luma=0 a=255          <- canvas captured 100% BLACK
+video hidden (cover up)
+first-frame ct=0.18 (1312ms after play)
+LAST-SWAP: 1514..1632ms
+```
+
+Two findings:
+1. **`cover: bridge`, not `cover: poster (last frame)`** → the poster cover never fired. The line is
+   the plain `cover: bridge` variant (not "poster not ready"), i.e. `outgoingItem.poster_path` was
+   **falsy** → `poster_path` is **NULL in the DB** for these clips. The backend chain is correct end
+   to end (upload extracts poster → `get_ambient_display` SELECT/returns `poster_path` → viewer
+   preloads + uses it); the clips simply predate the feature and **`backfill_posters` was never run**
+   (and/or the backend image wasn't rebuilt with ffmpeg).
+2. **`bridge px luma=0 a=255`** → `canvas.drawImage(video)` returns pure black on this panel,
+   confirming the hardware video plane composites above the HTML/canvas. So the **canvas bridge can
+   never hold the last frame on this device** — the server-extracted poster `<img>` is the *only*
+   cover that works. (Matches signageOS / Tizen-forum / Samsung guidance: gapless HTML5 video isn't
+   possible in the Tizen browser; cover the unavoidable decode gap with a real image.)
+
+`decode slow (810ms)` is only a warning threshold; the real first-frame gap is ~1.3–1.6 s
+(`first-frame … 1312ms`, `LAST-SWAP 1514–1632ms`). That window is what shows black today and what the
+poster cover replaces with the frozen last frame.
+
+### Changes in this rollout
+
+**1. Build/version stamp in the debugger (so deploys are verifiable on-panel).**
+- `vite.config.js`: read `package.json`, inject `__AMBIENT_BUILD__` (build timestamp) and
+  `__APP_VERSION__` via Vite `define`. The timestamp changes every build, so a stale value on the
+  panel means the redeploy didn't land.
+- `src/pages/AmbientViewerPage.jsx`: `ENGINE_VERSION` constant (bump on logic changes) +
+  `BUILD_STAMP` (from the inject, falls back to `'dev'` under Vitest). Logged at engine init
+  (`engine 2.1-poster-cover · build <ts>`) and shown as the **first line of the `?debug` HUD**.
+
+**2. Poster-coverage diagnostic (makes the NULL-poster cause self-evident).**
+- On first data load, the viewer logs `posters: N/M videos` — and `… — run server.backfill_posters`
+  (as a `warn`) when `N < M`. So "every swap will be black" is now one glance at the HUD.
+
+**3. Server-side decode normalization (`+faststart`, uniform H.264) to *shorten* the gap.**
+- `server/media_utils.py`: new `normalize_video(src, dst, timeout=300)` — re-encodes to a
+  Tizen-friendly MP4 (moov-at-front via `-movflags +faststart`, H.264 High / yuv420p, bounded GOP).
+  Native resolution + frame rate preserved (no scaling). **Safe by construction:** writes only to
+  `dst`, never raises, removes partial output, returns bool.
+- `server/routers/ambient_router.py`: video uploads are now normalized to `*-norm.mp4` (served file),
+  with poster extracted from the final file. If normalize fails, the original upload is kept. New
+  uploads only → fresh filenames → no cache-staleness with the immutable `/uploads` headers.
+- This **shortens, does not eliminate**, the first-frame gap; the poster cover handles the rest.
+
+**4. `server/backfill_posters.py`: opt-in `--normalize`.**
+- Default `python -m server.backfill_posters` is unchanged (posters-only, additive, idempotent) — this
+  is the step that fixes the **current** black screen (generates posters for existing clips so swaps
+  switch from `cover: bridge` to `cover: poster (last frame)`).
+- `--normalize` additionally re-encodes not-yet-normalized clips to `*-norm.mp4`: writes the new file,
+  **commits the DB pointer first**, then removes the old video + poster. Cache-safe (URL changes);
+  idempotent (skips `*-norm.mp4`); never loses the original on failure.
+
+**5. `docs/tizen-avplay-seamless.md` (scoping only, no code).**
+- Documents the one path to *true* gapless playback — a packaged Tizen SSSP app using
+  `webapis.avplay` (what MagicInfo uses) — its requirements, the fact that **even AVPlay black-flashes
+  on the first loop**, and why it's a separate architecture/deliverable. Sequenced as a deferred track.
+
+### Deploy / verify (in order)
+1. Rebuild backend so ffmpeg is present: `docker compose up -d --build backend`.
+2. **Fix existing clips (the black screen):** `docker compose exec backend python -m server.backfill_posters`
+   (optionally `--normalize` to also speed up their decode).
+3. Rebuild + redeploy frontend.
+4. On the panel with `?debug=true`: confirm the HUD top line shows the **new build timestamp**,
+   `posters: M/M videos`, and that swaps log **`cover: poster (last frame)`** with `bridge px luma>2`
+   (or no bridge line) — i.e. the last frame freezes instead of going black. `npm run lint` and
+   `npm run build` both pass.
+
+### Not changed (deliberately)
+Playback state machine, swap token guards, first-frame gate, `SWAP_TIMEOUT_MS`, and the
+`handleVideoError` backstop are untouched. No new npm/browser dependency; ffmpeg (already in the
+backend image) does posters + normalization. Browser-side load is unchanged — all new heavy work is
+server-side.
+
+---
+
+## 2026-06-02 — Senior-audit hardening: poster-freeze to 10/10 (engine v2.2-poster-freeze)
+
+Follow-up senior audit + implementation pass. Validated against official Samsung guides
+(using-video-elements, using-avplay, seamless-video-playback), the AVPlay Seamless StillMode/MixedFrame
+samples, signageOS HTML5 limitations, and community reports (Xibo). Findings: video→video already
+implemented the intended "instant-cut to poster, hold, reveal when paintable" flow; the real gaps were
+(1) a single-frame extraction that produces a BLACK poster on fade-to-black clips, (2) video→image not
+using the poster (relying on the Tizen plane holding its last frame), and (3) the cover fade-out being
+a small but real black-flash window over the glitch-prone video plane.
+
+### Changes
+**1. Smart, non-black last-frame extraction — `server/media_utils.py` (`extract_last_frame`).**
+Was: one frame at `-sseof -0.2` (a fade-to-black ending → black poster → instant-cut to black). Now:
+probe candidate offsets `[0.1,0.3,0.6,1.0,1.5,2.2]`s before EOF with a cheap **1-byte luma read**
+(`-vf scale=1:1 -pix_fmt gray -f rawvideo pipe:1`), pick the offset CLOSEST to the end with mean luma
+≥ 18; else the brightest candidate; else the first frame. ffmpeg-only (no Pillow). Logs the chosen
+offset + luma. Benefits upload + backfill automatically.
+
+**2. Hard-cut cover reveal (no fade) — `src/pages/AmbientViewerPage.jsx` (`runVideoToVideo`).**
+Replaced the 150ms `lowerCover`/`fadeOutBridge` poster/bridge fade with an instant `dropCover()`: the
+incoming video is revealed only once paintable (`readyState>=2 && currentTime>0`, unchanged), then the
+cover is removed in the same frame. Eliminates the semi-transparent window over the Tizen video plane
+where a black flash could leak. Removed the now-dead `lowerCover`, `fadeOutBridge`, and
+`BRIDGE_FADE_DURATION`.
+
+**3. Poster is the provably-sole cover; black bridge no longer masquerades.**
+`captureBridge` now ALWAYS runs the 3-pixel luma probe (negligible) and stores it in
+`lastBridgeLumaRef`. In `runVideoToVideo`, a captured bridge with luma ≤ 2 is treated as `cut` with a
+loud `cover: bridge BLACK (luma=…) — poster missing!` warning instead of raising a black layer that
+pretends to cover. (On this panel `drawImage` is black, so the bridge is effectively dead; kept only
+as a defensive path for firmwares where it works.)
+
+**4. video→image now routes through the poster freeze — `runVideoToImage`.**
+If the outgoing clip's poster is ready: hard-cut UP to the poster, pause+hide the `<video>`, then once
+the next image decodes show it opaque at z=2 BENEATH the poster and **hard-cut the poster off**
+(flash-free — never exposes the video plane). If no poster, falls back to the legacy direct
+video→image crossfade. This removes the last reliance on the Tizen plane holding a frame; every
+video-end is now video → poster(freeze) → next.
+
+**5. normalize_video capped to the documented decoder ceiling — `server/media_utils.py`.**
+signageOS documents Tizen 2.4–SSSP4 as FullHD@30. Added a tiny `ffprobe` for width/height/fps; now
+**downscales only when a source exceeds 1080×1920** (orientation-aware, `force_original_aspect_ratio=
+decrease:force_divisible_by=2`, never upscales) and **caps fps to 30 only when >30** (24/25/30 left
+untouched to avoid judder). `+faststart` / H.264 High / yuv420p / CRF unchanged. A 4K/60 upload would
+otherwise decode slower and worsen the gap.
+
+**6. Versioning.** `ENGINE_VERSION` → `2.2-poster-freeze` (HUD top line + init log + build stamp).
+
+**7. Docs.** `docs/tizen-avplay-seamless.md` refined per using-avplay: avplay privilege not needed on
+2015+, `webapis.avplaystore` two-player MixedFrame, `suspend`/`restore`, `setDisplayRect` 1920×1080
+base. Doc-only.
+
+### Reference validation
+Browser poster-freeze is confirmed the correct **production workaround (masking), not true seamless** —
+the Tizen browser has a single decoder (a 2nd `<video>` pauses the 1st; Xibo hits the same black
+screen). True seamless = native AVPlay in a `.wgt` (MagicInfo), which STILL black-flashes on the first
+loop — scoped/deferred, not adopted. Prioritized correctness + decode-gap masking, no native-gapless
+claims. Pre-concatenating clips into one file (a known alternative) was considered and rejected
+(breaks dynamic playlists, interleaved images, announcements, loop boundaries).
+
+### Verify
+`npm run lint` + `npm run build` green; `python -m py_compile` of the three backend files OK. On panel
+`?debug=true`: HUD shows `v2.2-poster-freeze · <build>`, `posters: M/M`; video→video AND video→image
+log `cover: poster (last frame)` and freeze the last frame (no black, no fade); no `cover: bridge
+BLACK` once posters exist. Upload a fade-to-black clip → its `*-poster.jpg` is the last BRIGHT frame
+(stdout luma log confirms).

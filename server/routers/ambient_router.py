@@ -14,7 +14,7 @@ from ..models import (
     ActivePlaylistRequest,
     PublishPlaylistRequest,
 )
-from ..media_utils import extract_last_frame
+from ..media_utils import extract_last_frame, normalize_video
 
 router = APIRouter()
 
@@ -286,15 +286,29 @@ def upload_ambient_media(
         }
         ext = ext_map.get(file.content_type, ".bin")
         media_type = "video" if file.content_type.startswith("video/") else "image"
-        filename = f"ambient-{display_id}-{int(time.time())}-{i}{ext}"
+        ts = int(time.time())
+        filename = f"ambient-{display_id}-{ts}-{i}{ext}"
         filepath = upload_dir / filename
         filepath.write_bytes(content)
 
-        # For videos, extract a last-frame poster so the Tizen viewer can hold the final frame on
-        # screen during the next clip's decode (no black gap). Best-effort: if ffmpeg is missing or
-        # fails, poster_path stays NULL and the viewer falls back to its canvas bridge.
+        # For videos: (1) normalize to a Tizen-friendly MP4 (faststart + uniform H.264) for faster,
+        # more consistent first-frame decode, then (2) extract a last-frame poster so the viewer can
+        # hold the final frame on screen during the next clip's decode (no black gap). Both steps are
+        # best-effort: if ffmpeg is missing or fails we keep the original upload, and (respectively)
+        # leave poster_path NULL so the viewer degrades to its canvas bridge.
         poster_path = None
         if media_type == "video":
+            normalized_name = f"ambient-{display_id}-{ts}-{i}-norm.mp4"
+            normalized_path = upload_dir / normalized_name
+            if normalize_video(filepath, normalized_path):
+                # Serve the normalized file; drop the raw upload (its bytes were never referenced by
+                # any URL, so removing it is safe and avoids leaving an orphan on disk).
+                try:
+                    filepath.unlink()
+                except OSError:
+                    pass
+                filename = normalized_name
+                filepath = normalized_path
             poster_filename = f"{Path(filename).stem}-poster.jpg"
             if extract_last_frame(filepath, upload_dir / poster_filename):
                 poster_path = f"/uploads/{poster_filename}"

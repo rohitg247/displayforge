@@ -1,32 +1,36 @@
-"""Idempotent backfill: generate last-frame poster JPEGs for existing ambient videos.
+"""Idempotent backfill for existing ambient videos.
 
 Run from the project root (or inside the backend container):
 
-    python -m server.backfill_posters
+    python -m server.backfill_posters              # posters only (safe, additive)
+    python -m server.backfill_posters --normalize  # also re-encode clips for faster Tizen decode
 
 Honours server.config.settings, so it uses the same DATABASE_PATH / UPLOAD_DIR as the app
-(e.g. the Docker /data volume). Safe to run repeatedly:
+(e.g. the Docker /data volume).
+
+Default pass (posters only) — safe to run repeatedly:
   - skips rows that already have poster_path set,
   - reuses a poster file that already exists on disk (just links it in the DB),
   - only shells out to ffmpeg for videos still missing a poster.
+
+--normalize pass (opt-in) — re-encodes each clip to a Tizen-friendly MP4 (`+faststart`, uniform
+H.264 High / yuv420p) to shorten the first-frame decode gap. It is non-destructive in ordering:
+the normalized file is written under a NEW name, the DB row is updated to point at it, and only
+THEN are the old video + old poster removed. Because the served URL changes, the immutable cache
+on the old URL is irrelevant (no stale-bytes risk). Idempotent: clips already named `*-norm.mp4`
+are skipped.
 """
 
+import argparse
 import sqlite3
 from pathlib import Path
 
 from .config import settings
-from .media_utils import extract_last_frame, ffmpeg_available
+from .media_utils import extract_last_frame, normalize_video, ffmpeg_available
 
 
-def main() -> None:
-    if not ffmpeg_available():
-        print("ffmpeg not found on PATH — cannot generate posters. Aborting.")
-        return
-
-    upload_dir = Path(settings.UPLOAD_DIR)
-    conn = sqlite3.connect(settings.DATABASE_PATH)
-    conn.row_factory = sqlite3.Row
-
+def _backfill_posters(conn, upload_dir) -> None:
+    """Ensure every video row has a poster. Safe, additive, idempotent."""
     rows = conn.execute(
         "SELECT id, file_path, poster_path FROM ambient_media WHERE media_type = 'video'"
     ).fetchall()
@@ -59,11 +63,101 @@ def main() -> None:
             failed += 1
             print(f"FAILED (missing file/decode)  media {r['id']:>4} ({r['file_path']})")
 
-    conn.close()
     print(
-        f"Done. generated={generated} linked={linked} "
+        f"Posters: generated={generated} linked={linked} "
         f"skipped(already set)={skipped} failed={failed}"
     )
+
+
+def _normalize_existing(conn, upload_dir) -> None:
+    """Re-encode each not-yet-normalized clip to a Tizen-friendly MP4 (opt-in). DB-first, then
+    remove the old files only after a successful commit, so a failure never loses the original."""
+    rows = conn.execute(
+        "SELECT id, file_path, poster_path FROM ambient_media WHERE media_type = 'video'"
+    ).fetchall()
+
+    normalized = skipped = missing = failed = 0
+    for r in rows:
+        src_name = Path(r["file_path"]).name
+        if src_name.endswith("-norm.mp4"):
+            skipped += 1
+            continue
+
+        src_disk = upload_dir / src_name
+        if not (src_disk.exists() and src_disk.stat().st_size > 0):
+            missing += 1
+            print(f"SKIP (missing source)   media {r['id']:>4} ({r['file_path']})")
+            continue
+
+        new_name = f"{src_disk.stem}-norm.mp4"
+        new_disk = upload_dir / new_name
+        if not normalize_video(src_disk, new_disk):
+            failed += 1
+            print(f"FAILED normalize        media {r['id']:>4} ({r['file_path']})")
+            continue
+
+        # Regenerate the poster from the normalized file (new stem -> new poster name).
+        new_poster_name = f"{new_disk.stem}-poster.jpg"
+        new_poster_disk = upload_dir / new_poster_name
+        new_poster_url = (
+            f"/uploads/{new_poster_name}" if extract_last_frame(new_disk, new_poster_disk) else None
+        )
+        new_url = f"/uploads/{new_name}"
+        old_poster = r["poster_path"]
+
+        # Commit the DB pointer first; the new files already exist on disk.
+        conn.execute(
+            "UPDATE ambient_media SET file_path = ?, poster_path = ? WHERE id = ?",
+            (new_url, new_poster_url, r["id"]),
+        )
+        conn.commit()
+
+        # Only now remove the superseded files (best-effort; URLs changed so no cache staleness).
+        stale = [src_disk]
+        if old_poster:
+            stale.append(upload_dir / Path(old_poster).name)
+        for f in stale:
+            if f.exists():
+                try:
+                    f.unlink()
+                except OSError:
+                    pass
+
+        normalized += 1
+        print(f"normalized              media {r['id']:>4} -> {new_url} (poster: {new_poster_url})")
+
+    print(
+        f"Normalize: normalized={normalized} skipped(already -norm)={skipped} "
+        f"missing={missing} failed={failed}"
+    )
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="Backfill posters (and optionally normalize) ambient videos.")
+    parser.add_argument(
+        "--normalize",
+        action="store_true",
+        help="Also re-encode existing clips to a Tizen-friendly MP4 for faster decode "
+             "(writes new files, updates DB, removes originals). Default: off.",
+    )
+    args = parser.parse_args()
+
+    if not ffmpeg_available():
+        print("ffmpeg not found on PATH — cannot process videos. Aborting.")
+        return
+
+    upload_dir = Path(settings.UPLOAD_DIR)
+    conn = sqlite3.connect(settings.DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+
+    # Opt-in normalization first: it rewrites file_path + poster_path, so the poster pass afterward
+    # is a no-op for those rows (poster_path already set) and only catches anything left over.
+    if args.normalize:
+        _normalize_existing(conn, upload_dir)
+    _backfill_posters(conn, upload_dir)
+
+    conn.close()
+    print("Done.")
 
 
 if __name__ == "__main__":
