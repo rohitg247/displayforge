@@ -132,6 +132,31 @@ def _normalize_existing(conn, upload_dir) -> None:
     )
 
 
+def _backfill_playlist_videos(conn) -> None:
+    """Build the single concatenated loop video for every display's LIVE playlist (idempotent).
+
+    This is what removes the Tizen per-clip black gap on EXISTING displays without needing to
+    re-publish each one from the UI. Reuses the exact router logic (signature, skip-if-unchanged,
+    stale-file cleanup) so behaviour matches a normal publish."""
+    from .routers.ambient_router import _regenerate_playlist_video
+
+    rows = conn.execute("SELECT id, name FROM ambient_displays ORDER BY id").fetchall()
+    built = 0
+    for r in rows:
+        before = conn.execute(
+            "SELECT playlist_video_path FROM ambient_displays WHERE id = ?", (r["id"],)
+        ).fetchone()["playlist_video_path"]
+        _regenerate_playlist_video(conn, r["id"])
+        after = conn.execute(
+            "SELECT playlist_video_path FROM ambient_displays WHERE id = ?", (r["id"],)
+        ).fetchone()["playlist_video_path"]
+        status = "built/updated" if after and after != before else ("kept" if after else "none (<2 live items)")
+        print(f"playlist-video  display {r['id']:>4} ({r['name']}): {status} -> {after}")
+        if after and after != before:
+            built += 1
+    print(f"Playlist videos: built/updated={built} total displays={len(rows)}")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Backfill posters (and optionally normalize) ambient videos.")
     parser.add_argument(
@@ -139,6 +164,12 @@ def main() -> None:
         action="store_true",
         help="Also re-encode existing clips to a Tizen-friendly MP4 for faster decode "
              "(writes new files, updates DB, removes originals). Default: off.",
+    )
+    parser.add_argument(
+        "--playlist-videos",
+        action="store_true",
+        help="Also build the single concatenated loop video for each display's live playlist "
+             "(the per-clip black-gap fix). Safe/idempotent. Default: off.",
     )
     args = parser.parse_args()
 
@@ -155,6 +186,8 @@ def main() -> None:
     if args.normalize:
         _normalize_existing(conn, upload_dir)
     _backfill_posters(conn, upload_dir)
+    if args.playlist_videos:
+        _backfill_playlist_videos(conn)
 
     conn.close()
     print("Done.")

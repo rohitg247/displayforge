@@ -153,4 +153,14 @@ export const api = {
     }),
   deleteAmbientMedia: (mediaId) =>
     request(`/api/ambient/media/${mediaId}`, { method: 'DELETE' }),
+
+  // Capture of the on-panel ?debug log. Sent as a plain string body (no JSON Content-Type) so the TV
+  // browser treats it as a "simple" request and skips the CORS preflight; the backend reads the raw
+  // body. Returns the fetch promise so the caller can confirm delivery (res.ok) and retry the batch
+  // on failure — no `keepalive` (its 64 kB cap would truncate large catch-up batches).
+  postAmbientDebugLog: (id, payload) =>
+    fetch(`${API_BASE}/api/ambient/${id}/debug-log`, {
+      method: 'POST',
+      body: JSON.stringify(payload),
+    }),
 };

@@ -12,6 +12,9 @@ migrations = [
     "ALTER TABLE ambient_media ADD COLUMN playlist TEXT NOT NULL DEFAULT 'A'",
     "ALTER TABLE ambient_media ADD COLUMN status TEXT NOT NULL DEFAULT 'draft'",
     "ALTER TABLE ambient_media ADD COLUMN poster_path TEXT DEFAULT NULL",
+    "ALTER TABLE ambient_media ADD COLUMN duration INTEGER DEFAULT NULL",
+    "ALTER TABLE ambient_displays ADD COLUMN playlist_video_path TEXT DEFAULT NULL",
+    "ALTER TABLE ambient_displays ADD COLUMN playlist_video_sig TEXT DEFAULT NULL",
     "ALTER TABLE case_studies ADD COLUMN is_published INTEGER NOT NULL DEFAULT 0",
 ]
 

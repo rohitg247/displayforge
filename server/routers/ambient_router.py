@@ -1,7 +1,11 @@
+import hashlib
+import json
 import sqlite3
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Request
+from fastapi.responses import PlainTextResponse
 from ..database import db_dependency
 from ..auth import get_current_user
 from ..config import settings
@@ -14,9 +18,159 @@ from ..models import (
     ActivePlaylistRequest,
     PublishPlaylistRequest,
 )
-from ..media_utils import extract_last_frame, normalize_video
+from ..media_utils import extract_last_frame, normalize_video, build_playlist_video
 
 router = APIRouter()
+
+# On-panel debug logs (?debug=true) are POSTed here so they can be read back from a browser instead
+# of photographing the TV. Kept OUT of the /uploads static mount (which is immutable-cached) so the
+# served log is never stale; the GET endpoint sets no-cache explicitly.
+# Storage model: ONE append-only file per display per day (`ambient-<id>-<YYYY-MM-DD>.log`) holding
+# every event in detail (the viewer streams all events while ?debug is open), plus a small overwritten
+# `…-latest.json` status snapshot. Files older than the retention window are pruned, so the count is
+# bounded (≤ retention days per display) — no per-snapshot file explosion.
+_DEBUG_LOG_DIR = Path(settings.DATABASE_PATH).parent / "debug-logs"
+_DEBUG_LOG_MAX_BYTES = 1024 * 1024        # per-POST body cap (a full event batch can be large)
+_DEBUG_LOG_RETENTION_DAYS = 7             # keep the last 7 days of day-files per display
+_DEBUG_LOG_TAIL_BYTES = 2 * 1024 * 1024   # GET returns at most the last ~2 MB of a day-file
+
+
+def _prune_debug_logs(display_id, now: datetime) -> None:
+    """Delete this display's day-files older than the retention window (by mtime)."""
+    cutoff = (now - timedelta(days=_DEBUG_LOG_RETENTION_DAYS)).timestamp()
+    for p in _DEBUG_LOG_DIR.glob(f"ambient-{display_id}-*.log"):
+        try:
+            if p.stat().st_mtime < cutoff:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def _tail_text(path: Path, max_bytes: int) -> str:
+    """Return a file's text, capped to the last `max_bytes` (dropping a partial leading line)."""
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                data = f.read()
+                nl = data.find(b"\n")
+                if nl != -1:
+                    data = data[nl + 1:]
+                return f"… (truncated to last {max_bytes // 1024} KB) …\n" + data.decode("utf-8", "ignore")
+            return path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return ""
+
+
+def _is_built_concat(url_or_path) -> bool:
+    """True only for files WE built (ambient-<id>-playlist-<sig>.mp4). A single-item playlist points
+    `playlist_video_path` straight at a real media clip; those must NEVER be deleted as 'stale'."""
+    return bool(url_or_path) and "-playlist-" in Path(url_or_path).name
+
+
+def _unlink_upload(upload_dir: Path, url_or_path) -> None:
+    if not url_or_path:
+        return
+    f = upload_dir / Path(url_or_path).name
+    if f.exists():
+        try:
+            f.unlink()
+        except OSError:
+            pass
+
+
+def _regenerate_playlist_video(db: sqlite3.Connection, display_id: int) -> None:
+    """Rebuild the single concatenated loop video for a display's LIVE playlist (best-effort).
+
+    Playing one continuous file is what actually removes the Tizen per-clip black gap (no <video>.src
+    swaps → no decoder teardown). This is called after any change to live content. It is idempotent
+    via a signature of the live items: if the live set is unchanged the existing file is kept. On any
+    failure it clears the pointer so the viewer cleanly falls back to its per-item engine.
+    """
+    disp = db.execute(
+        "SELECT active_playlist, orientation, playlist_video_path, playlist_video_sig FROM ambient_displays WHERE id = ?",
+        (display_id,),
+    ).fetchone()
+    if not disp:
+        return
+
+    playlist = disp["active_playlist"] or "A"
+    rows = db.execute(
+        """SELECT file_path, media_type, sort_order, duration FROM ambient_media
+           WHERE ambient_display_id = ? AND playlist = ? AND status = 'live'
+           ORDER BY sort_order, id""",
+        (display_id, playlist),
+    ).fetchall()
+
+    upload_dir = Path(settings.UPLOAD_DIR)
+    items = [{"file_path": r["file_path"], "media_type": r["media_type"], "duration": r["duration"]} for r in rows]
+
+    # Signature of the live set (filenames + order + per-image duration + orientation + audio mode).
+    # Unchanged sig ⇒ nothing to do. Use a STABLE hash (not Python's per-process salted hash()) so the
+    # filename/skip check is consistent across restarts.
+    sig_src = (
+        "|".join(f"{it['media_type']}:{it['file_path']}:{it['duration'] or ''}" for it in items)
+        + f"@{disp['orientation']}|audio={settings.AMBIENT_PLAYLIST_AUDIO}|img={settings.AMBIENT_IMAGE_SECONDS}"
+    )
+    sig = hashlib.sha1(sig_src.encode("utf-8")).hexdigest()[:12]
+
+    old_path = disp["playlist_video_path"]
+
+    # Single-item playlist needs no concat:
+    #   one VIDEO -> point straight at that clip's URL; the viewer's seamless seek-to-0 loop runs on
+    #                it directly (one <video> looping one file — lossless, no build).
+    #   one IMAGE / empty -> NULL (a still never loop-blacks; the per-item engine renders it).
+    if len(items) < 2:
+        single_url = items[0]["file_path"] if (items and items[0]["media_type"] == "video") else None
+        single_sig = ("single:" + single_url) if single_url else None
+        if old_path != single_url or disp["playlist_video_sig"] != single_sig:
+            db.execute(
+                "UPDATE ambient_displays SET playlist_video_path = ?, playlist_video_sig = ? WHERE id = ?",
+                (single_url, single_sig, display_id),
+            )
+            db.commit()
+            if _is_built_concat(old_path) and Path(old_path).name != Path(single_url or "x").name:
+                _unlink_upload(upload_dir, old_path)
+        return
+
+    if disp["playlist_video_sig"] == sig and disp["playlist_video_path"]:
+        existing = upload_dir / Path(disp["playlist_video_path"]).name
+        if existing.exists() and existing.stat().st_size > 0:
+            return  # live set unchanged and file present — keep it
+
+    out_name = f"ambient-{display_id}-playlist-{sig}.mp4"
+    out_path = upload_dir / out_name
+    abs_items = [
+        {"file_path": str(upload_dir / Path(it["file_path"]).name),
+         "media_type": it["media_type"], "duration": it["duration"]}
+        for it in items
+    ]
+    ok = out_path.exists() and out_path.stat().st_size > 0
+    if not ok:
+        ok = build_playlist_video(
+            abs_items, out_path, disp["orientation"],
+            image_seconds=settings.AMBIENT_IMAGE_SECONDS,
+            include_audio=settings.AMBIENT_PLAYLIST_AUDIO,
+        )
+
+    if ok:
+        db.execute(
+            "UPDATE ambient_displays SET playlist_video_path = ?, playlist_video_sig = ? WHERE id = ?",
+            (f"/uploads/{out_name}", sig, display_id),
+        )
+        db.commit()
+        # Remove a now-superseded BUILT concat (never a real media clip pointed at directly).
+        if _is_built_concat(old_path) and Path(old_path).name != out_name:
+            _unlink_upload(upload_dir, old_path)
+    else:
+        # Build failed — clear the pointer so the viewer falls back to the per-item engine.
+        if disp["playlist_video_path"]:
+            db.execute(
+                "UPDATE ambient_displays SET playlist_video_path = NULL, playlist_video_sig = NULL WHERE id = ?",
+                (display_id,),
+            )
+            db.commit()
 
 
 @router.get("", response_model=list[AmbientDisplayOut])
@@ -90,7 +244,7 @@ def get_ambient_display(
 
     if playlist and playlist in ("A", "B"):
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path
+            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path, duration
                 FROM ambient_media
                 WHERE ambient_display_id = ? AND playlist = ? {status_filter}
                 ORDER BY sort_order, id""",
@@ -98,12 +252,24 @@ def get_ambient_display(
         ).fetchall()
     else:
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path
+            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path, duration
                 FROM ambient_media
                 WHERE ambient_display_id = ? {status_filter}
                 ORDER BY sort_order, id""",
             (display_id,),
         ).fetchall()
+
+    # The pre-built single-loop video applies to the LIVE active playlist only (it's what removes the
+    # Tizen per-clip black gap). Don't offer it in admin/preview mode (draft content, specific
+    # playlist) — there the per-item engine renders the draft. `disp` is SELECT * so the column is
+    # present once the migration has run; guard with a default for older rows.
+    playlist_video = None
+    if not admin:
+        pv = disp["playlist_video_path"] if "playlist_video_path" in disp.keys() else None
+        if pv:
+            pv_disk = Path(settings.UPLOAD_DIR) / Path(pv).name
+            if pv_disk.exists() and pv_disk.stat().st_size > 0:
+                playlist_video = pv
 
     return {
         "id": disp["id"],
@@ -115,6 +281,7 @@ def get_ambient_display(
         "announcement_name": disp["announcement_name"] or "",
         "announcement_title": disp["announcement_title"] or "",
         "announcement_enabled": disp["announcement_enabled"],
+        "playlist_video": playlist_video,
         "media": [dict(m) for m in media_rows],
     }
 
@@ -218,6 +385,9 @@ def publish_playlist(
     )
     db.commit()
 
+    # Live content just changed — rebuild the single concatenated loop video for the panel.
+    _regenerate_playlist_video(db, display_id)
+
     return {"status": "ok", "active_playlist": body.playlist}
 
 
@@ -227,7 +397,9 @@ def delete_ambient_display(
     db: sqlite3.Connection = Depends(db_dependency),
     user: dict = Depends(get_current_user),
 ):
-    disp = db.execute("SELECT id FROM ambient_displays WHERE id = ?", (display_id,)).fetchone()
+    disp = db.execute(
+        "SELECT id, playlist_video_path FROM ambient_displays WHERE id = ?", (display_id,)
+    ).fetchone()
     if not disp:
         raise HTTPException(status_code=404, detail="Ambient display not found")
 
@@ -243,6 +415,11 @@ def delete_ambient_display(
             if poster.exists():
                 poster.unlink()
 
+    # Remove the BUILT concatenated loop video too (it's not an ambient_media row). Skip when the
+    # pointer is a single real clip URL — that file is already handled by the media loop above.
+    if _is_built_concat(disp["playlist_video_path"]):
+        _unlink_upload(Path(settings.UPLOAD_DIR), disp["playlist_video_path"])
+
     db.execute("DELETE FROM ambient_displays WHERE id = ?", (display_id,))
     db.commit()
 
@@ -252,6 +429,7 @@ def upload_ambient_media(
     display_id: int,
     files: list[UploadFile] = File(...),
     playlist: str = Form(default="A"),
+    durations: str = Form(default=""),
     user: dict = Depends(get_current_user),
     db: sqlite3.Connection = Depends(db_dependency),
 ):
@@ -264,6 +442,21 @@ def upload_ambient_media(
 
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(exist_ok=True)
+
+    # Optional per-file image durations (seconds), comma-separated and aligned to `files` by index.
+    # FULLY OPTIONAL and backward-compatible: the current upload UI doesn't send it, so every entry is
+    # NULL and images use the default seconds. A future UI can send e.g. "8,,5" to set durations at
+    # upload time without any change to this endpoint's existing callers. Only applied to images.
+    dur_tokens = [t.strip() for t in durations.split(",")] if durations else []
+
+    def _parse_duration(idx: int):
+        if idx >= len(dur_tokens) or not dur_tokens[idx]:
+            return None
+        try:
+            val = int(dur_tokens[idx])
+            return val if val > 0 else None
+        except ValueError:
+            return None
 
     max_order = db.execute(
         "SELECT COALESCE(MAX(sort_order), -1) AS mx FROM ambient_media WHERE ambient_display_id = ? AND playlist = ?",
@@ -313,10 +506,13 @@ def upload_ambient_media(
             if extract_last_frame(filepath, upload_dir / poster_filename):
                 poster_path = f"/uploads/{poster_filename}"
 
+        # Per-image on-screen seconds (images only; NULL for video → uses its own length).
+        duration = _parse_duration(i) if media_type == "image" else None
+
         sort_order = max_order + 1 + i
         cursor = db.execute(
-            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order, poster_path) VALUES (?, ?, ?, ?, ?, ?)",
-            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order, poster_path),
+            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order, poster_path, duration) VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order, poster_path, duration),
         )
         db.commit()
         uploaded.append({
@@ -328,6 +524,7 @@ def upload_ambient_media(
             "sort_order": sort_order,
             "status": "draft",
             "poster_path": poster_path,
+            "duration": duration,
         })
 
     return {"media": uploaded}
@@ -346,6 +543,7 @@ def reorder_ambient_media(
             (idx, media_id, display_id),
         )
     db.commit()
+    _regenerate_playlist_video(db, display_id)
     return {"status": "ok"}
 
 
@@ -370,3 +568,101 @@ def delete_ambient_media(
 
     db.execute("DELETE FROM ambient_media WHERE id = ?", (media_id,))
     db.commit()
+    _regenerate_playlist_video(db, media["ambient_display_id"])
+
+
+# ----------------------------------------------------------------------------------------------
+# On-panel debug-log capture (?debug=true). The viewer POSTs its rolling event log + HUD header so
+# we can read it back from a browser (GET .../debug-log/latest) instead of photographing the TV.
+# ----------------------------------------------------------------------------------------------
+
+@router.post("/{display_id}/debug-log")
+async def post_ambient_debug_log(display_id: int, request: Request):
+    """Append a batch of debug events from the on-panel viewer to today's day-file, in full detail.
+    The viewer only POSTs while `?debug=true` is open and streams EVERY event (not a rolling window),
+    so the day-file is a complete, timestamped transcript. Best-effort, unauthenticated (local
+    network); JSON sent as text/plain so the TV browser makes no CORS preflight."""
+    raw = await request.body()
+    if len(raw) > _DEBUG_LOG_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Debug log too large")
+    try:
+        payload = json.loads(raw.decode("utf-8", "ignore") or "{}")
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+    if not isinstance(payload, dict):
+        raise HTTPException(status_code=400, detail="Expected a JSON object")
+
+    now = datetime.now(timezone.utc)
+    events = payload.get("events") or []
+    _DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Overwritten status snapshot — a quick "right now" view (engine/build/url + live header).
+    status = {
+        "display_id": display_id,
+        "captured_at": now.isoformat(timespec="seconds"),
+        "engine": payload.get("engine"),
+        "build": payload.get("build"),
+        "url": payload.get("url"),
+        "header": payload.get("header"),
+    }
+    (_DEBUG_LOG_DIR / f"ambient-{display_id}-latest.json").write_text(
+        json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8"
+    )
+
+    # Append every event (full detail) to today's day-file with a wall-clock timestamp.
+    appended = 0
+    if isinstance(events, list) and events:
+        day_file = _DEBUG_LOG_DIR / f"ambient-{display_id}-{now.strftime('%Y-%m-%d')}.log"
+        lines = []
+        for e in events:
+            if not isinstance(e, dict):
+                continue
+            at = e.get("at") or now.isoformat(timespec="milliseconds")
+            seq = e.get("seq", "")
+            klass = e.get("klass", "")
+            msg = e.get("msg", "")
+            lines.append(f"{at}  #{seq:<7} [{klass:<9}] {msg}")
+        if lines:
+            with day_file.open("a", encoding="utf-8") as f:
+                f.write("\n".join(lines) + "\n")
+            appended = len(lines)
+
+    _prune_debug_logs(display_id, now)
+    return {"status": "ok", "appended": appended}
+
+
+@router.get("/{display_id}/debug-log/latest", response_class=PlainTextResponse)
+def get_ambient_debug_log_latest(display_id: int, date: str = Query(default=None)):
+    """Return a day's FULL debug transcript as plain text (open in a browser, select-all, paste).
+    Defaults to the most recent day; pass `?date=YYYY-MM-DD` to view another of the retained days.
+    No-cache so a refresh always shows the newest events."""
+    no_cache = {"Cache-Control": "no-store"}
+    files = sorted(_DEBUG_LOG_DIR.glob(f"ambient-{display_id}-*.log"))
+    if not files:
+        return PlainTextResponse(
+            f"No debug log captured yet for display {display_id}.\n"
+            f"Open the viewer with ?debug=true on the panel, let it run, then refresh.",
+            headers=no_cache,
+        )
+
+    available = [f.stem.split("-", 2)[2] for f in files]  # 'ambient-<id>-YYYY-MM-DD' -> 'YYYY-MM-DD'
+    if date:
+        target = _DEBUG_LOG_DIR / f"ambient-{display_id}-{date}.log"
+        if not target.exists():
+            return PlainTextResponse(
+                f"No log for {date}. Available days: {', '.join(available)}", headers=no_cache,
+            )
+    else:
+        target = files[-1]
+    shown = target.stem.split("-", 2)[2]
+
+    header_path = _DEBUG_LOG_DIR / f"ambient-{display_id}-latest.json"
+    status = header_path.read_text(encoding="utf-8") if header_path.exists() else "(none)"
+    body = (
+        f"=== ambient display {display_id} — debug log ===\n"
+        f"Available days (last {_DEBUG_LOG_RETENTION_DAYS}): {', '.join(available)}\n"
+        f"Showing: {shown}   (append ?date=YYYY-MM-DD to view another day)\n\n"
+        f"--- STATUS (latest snapshot) ---\n{status}\n\n"
+        f"--- EVENTS (full detail) ---\n{_tail_text(target, _DEBUG_LOG_TAIL_BYTES)}"
+    )
+    return PlainTextResponse(body, headers=no_cache)

@@ -15,6 +15,8 @@ Two responsibilities, both best-effort and ffmpeg-only (no extra Python deps):
 
 import shutil
 import subprocess
+import tempfile
+from collections import Counter
 from pathlib import Path
 
 # A frame whose mean luma (0-255) is below this is treated as (near-)black: useless as a freeze-frame.
@@ -216,6 +218,230 @@ def normalize_video(src_path, dst_path, timeout: int = 300) -> bool:
     proc = _run(cmd, timeout)
     if proc is not None and proc.returncode == 0 and dst_path.exists() and dst_path.stat().st_size > 0:
         return True
+    if dst_path.exists():
+        try:
+            dst_path.unlink()
+        except OSError:
+            pass
+    return False
+
+
+# Default on-screen seconds for a still image when it is baked into the concatenated loop video.
+IMAGE_SEGMENT_SECONDS = 5
+# Closed-GOP / IDR-keyframe args shared by every generated segment, so concat join points AND the
+# loop point (frame 0) are keyframes — clean cuts and an instant, glitch-free seek-to-0 loop.
+_GOP_ARGS = ["-g", "60", "-keyint_min", "60", "-sc_threshold", "0"]
+# Uniform audio spec used ONLY when audio is kept (see build_playlist_video include_audio). All
+# segments are normalised to this so `-c copy` concat stays valid; video is never re-encoded for it.
+_AUDIO_RATE = "44100"
+_AUDIO_CH = "2"
+_ANULLSRC = f"anullsrc=r={_AUDIO_RATE}:cl=stereo"
+
+
+def _has_audio(path, timeout: int = 15) -> bool:
+    """True if the file has at least one audio stream (used only on the include_audio path)."""
+    if not _ffprobe_available():
+        return False
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "a:0",
+           "-show_entries", "stream=codec_name", "-of", "csv=p=0", str(path)]
+    proc = _run(cmd, timeout)
+    return bool(proc is not None and proc.returncode == 0 and proc.stdout and proc.stdout.strip())
+
+
+def _orientation_box(orientation: str):
+    """Target (width, height) for a display orientation, at the FullHD decoder ceiling."""
+    if orientation == "portrait":
+        return (_MAX_SHORT_SIDE, _MAX_LONG_SIDE)   # 1080 x 1920
+    return (_MAX_LONG_SIDE, _MAX_SHORT_SIDE)        # 1920 x 1080
+
+
+def _probe_stream(video_path: Path, timeout: int = 15):
+    """Return {codec, w, h, pix_fmt, fps} for the first video stream, or None on failure."""
+    if not _ffprobe_available():
+        return None
+    cmd = [
+        "ffprobe", "-v", "error", "-select_streams", "v:0",
+        "-show_entries", "stream=codec_name,width,height,pix_fmt,avg_frame_rate",
+        "-of", "csv=p=0", str(video_path),
+    ]
+    proc = _run(cmd, timeout)
+    if proc is None or proc.returncode != 0 or not proc.stdout:
+        return None
+    parts = proc.stdout.decode("utf-8", "ignore").strip().split(",")
+    if len(parts) < 5:
+        return None
+    try:
+        codec, pix_fmt = parts[0].strip(), parts[3].strip()
+        w, h = int(parts[1]), int(parts[2])
+    except ValueError:
+        return None
+    fps, fr = None, parts[4].strip()
+    try:
+        if "/" in fr:
+            num, den = fr.split("/")
+            fps = (float(num) / float(den)) if float(den) else None
+        elif fr:
+            fps = float(fr)
+    except (ValueError, ZeroDivisionError):
+        fps = None
+    return {"codec": codec, "w": w, "h": h, "pix_fmt": pix_fmt, "fps": fps}
+
+
+def _within_ceiling(w, h):
+    return max(w, h) <= _MAX_LONG_SIDE and min(w, h) <= _MAX_SHORT_SIDE
+
+
+def _pick_target_spec(video_metas, orientation):
+    """Pick the concat target (w, h, fps): the most common geometry among in-spec H.264/yuv420p
+    videos (so the MOST clips can be stream-copied losslessly), else the orientation box @30."""
+    geos, fpss = Counter(), Counter()
+    for m in video_metas:
+        if not m or m["codec"] != "h264" or m["pix_fmt"] != "yuv420p" or not _within_ceiling(m["w"], m["h"]):
+            continue
+        geos[(m["w"], m["h"])] += 1
+        if m["fps"]:
+            fpss[min(round(m["fps"]), _MAX_FPS)] += 1
+    tw, th = geos.most_common(1)[0][0] if geos else _orientation_box(orientation)
+    tfps = fpss.most_common(1)[0][0] if fpss else _MAX_FPS
+    return tw, th, tfps
+
+
+def _conforms(meta, tw, th, tfps):
+    """True if a video can be stream-copied into the concat as-is (geometry/codec/fps match)."""
+    return bool(
+        meta and meta["codec"] == "h264" and meta["pix_fmt"] == "yuv420p"
+        and meta["w"] == tw and meta["h"] == th
+        and meta["fps"] and round(meta["fps"]) == round(tfps)
+    )
+
+
+def _remux_copy_segment(src, dst, timeout, include_audio=False) -> bool:
+    """LOSSLESS copy of a conforming video's picture into a concat segment (`-c:v copy`). The video is
+    never re-encoded — bytes identical. By default audio is stripped (`-an`) so segments share a
+    video-only layout. When include_audio is on, audio is normalised to the uniform AAC spec (a silent
+    track is synthesised if the source has none) so the segment still matches its peers — the VIDEO is
+    still a pure stream copy."""
+    cmd = ["ffmpeg", "-y", "-i", str(src)]
+    if include_audio and not _has_audio(src):
+        cmd += ["-f", "lavfi", "-i", _ANULLSRC]
+        cmd += ["-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy",
+                "-c:a", "aac", "-ar", _AUDIO_RATE, "-ac", _AUDIO_CH, "-shortest"]
+    elif include_audio:
+        cmd += ["-map", "0:v:0", "-map", "0:a:0", "-c:v", "copy",
+                "-c:a", "aac", "-ar", _AUDIO_RATE, "-ac", _AUDIO_CH]
+    else:
+        cmd += ["-map", "0:v:0", "-c:v", "copy", "-an"]
+    cmd += ["-movflags", "+faststart", str(dst)]
+    proc = _run(cmd, timeout)
+    return proc is not None and proc.returncode == 0 and Path(dst).exists() and Path(dst).stat().st_size > 0
+
+
+def _encode_segment(src, dst, w, h, fps, timeout, is_image=False,
+                    image_seconds=IMAGE_SEGMENT_SECONDS, include_audio=False) -> bool:
+    """Encode ONE input to a segment at the exact (w,h,fps) concat spec. Used for every still image
+    (no motion to degrade) and only for the occasional video that doesn't already conform. Cover-scale
+    + crop matches the viewer's objectFit:cover (no bars); CRF 16 is visually lossless. When
+    include_audio is on, every segment gets a uniform AAC track (the source's audio, or synthesised
+    silence for images / silent videos) so `-c copy` concat stays valid."""
+    vf = (f"scale={w}:{h}:force_original_aspect_ratio=increase,"
+          f"crop={w}:{h},setsar=1,fps={fps},format=yuv420p")
+    cmd = ["ffmpeg", "-y"]
+    if is_image:
+        cmd += ["-loop", "1", "-t", str(image_seconds), "-i", str(src)]
+    else:
+        cmd += ["-i", str(src)]
+    # Decide the audio source (input index) before assembling output maps.
+    synth_audio = include_audio and (is_image or not _has_audio(src))
+    if synth_audio:
+        cmd += ["-f", "lavfi", "-i", _ANULLSRC]
+    cmd += ["-map", "0:v:0", "-vf", vf,
+            "-c:v", "libx264", "-profile:v", "high", "-pix_fmt", "yuv420p",
+            "-preset", "veryfast", "-crf", "16"] + _GOP_ARGS
+    if include_audio:
+        cmd += (["-map", "1:a:0", "-shortest"] if synth_audio else ["-map", "0:a:0"])
+        cmd += ["-c:a", "aac", "-ar", _AUDIO_RATE, "-ac", _AUDIO_CH]
+    else:
+        cmd += ["-an"]
+    cmd += ["-movflags", "+faststart", str(dst)]
+    proc = _run(cmd, timeout)
+    return proc is not None and proc.returncode == 0 and Path(dst).exists() and Path(dst).stat().st_size > 0
+
+
+def build_playlist_video(items, dst_path, orientation, image_seconds: int = IMAGE_SEGMENT_SECONDS,
+                         timeout: int = 600, include_audio: bool = False) -> bool:
+    """Join a playlist's clips/images into ONE continuous loop video with NO re-encode of conforming
+    video (stream copy). The Tizen panel then plays the whole playlist from a single <video>: no
+    `src` swaps mid-playlist (no per-clip black gap) and — with the viewer's pre-end seek-to-0 loop —
+    no black at the loop restart either.
+
+    Quality policy (user-approved): clips already sharing the dominant H.264/yuv420p geometry are
+    **stream-copied byte-for-byte** (the video is never re-encoded). Still images are encoded once
+    (no motion to degrade). Only a non-conforming video is re-encoded once to the target spec. The
+    join itself is `ffmpeg -f concat -c copy` — zero re-encode of the joined stream.
+
+    `items`: ordered dicts with absolute `file_path` + `media_type` ('video'|'image') and an optional
+    per-item `duration` (seconds, images only; falls back to `image_seconds`). `include_audio` keeps a
+    uniform AAC track in the output (default OFF — the player is muted; the video is still copied
+    losslessly either way). Safe by construction: writes only `dst_path`, never raises, returns True
+    only on a non-empty output.
+    """
+    dst_path = Path(dst_path)
+    if not ffmpeg_available():
+        return False
+
+    present = [it for it in items
+               if Path(it["file_path"]).exists() and Path(it["file_path"]).stat().st_size > 0]
+    if not present:
+        return False
+
+    video_metas = [
+        _probe_stream(Path(it["file_path"])) if it.get("media_type") != "image" else None
+        for it in present
+    ]
+    tw, th, tfps = _pick_target_spec(video_metas, orientation)
+    seg_timeout = max(60, timeout // max(1, len(present)))
+    copied = encoded = 0
+
+    try:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            seg_paths = []
+            for i, it in enumerate(present):
+                seg = tmp / f"seg{i:03d}.mp4"
+                src = Path(it["file_path"])
+                if it.get("media_type") == "image":
+                    secs = it.get("duration") or image_seconds
+                    ok = _encode_segment(src, seg, tw, th, tfps, seg_timeout, is_image=True,
+                                         image_seconds=secs, include_audio=include_audio)
+                    encoded += 1 if ok else 0
+                elif _conforms(video_metas[i], tw, th, tfps):
+                    ok = _remux_copy_segment(src, seg, seg_timeout, include_audio=include_audio)
+                    if ok:
+                        copied += 1
+                    else:  # lossless remux failed for some reason — re-encode as a fallback
+                        ok = _encode_segment(src, seg, tw, th, tfps, seg_timeout, include_audio=include_audio)
+                        encoded += 1 if ok else 0
+                else:
+                    ok = _encode_segment(src, seg, tw, th, tfps, seg_timeout, include_audio=include_audio)
+                    encoded += 1 if ok else 0
+                if ok:
+                    seg_paths.append(seg)
+
+            if not seg_paths:
+                return False
+
+            list_file = tmp / "concat.txt"
+            list_file.write_text("".join(f"file '{p.as_posix()}'\n" for p in seg_paths), encoding="utf-8")
+            cmd = ["ffmpeg", "-y", "-f", "concat", "-safe", "0", "-i", str(list_file),
+                   "-c", "copy", "-movflags", "+faststart", str(dst_path)]
+            proc = _run(cmd, timeout)
+            if proc is not None and proc.returncode == 0 and dst_path.exists() and dst_path.stat().st_size > 0:
+                print(f"playlist-video: {dst_path.name} <- {len(seg_paths)} seg "
+                      f"(copied={copied} encoded={encoded}) @ {tw}x{th}@{tfps}")
+                return True
+    except OSError:
+        pass
+
     if dst_path.exists():
         try:
             dst_path.unlink()

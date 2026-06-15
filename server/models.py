@@ -119,6 +119,7 @@ class AmbientMediaOut(BaseModel):
     sort_order: int
     status: str = "draft"          # ← add this line
     poster_path: Optional[str] = None   # last-frame JPEG for video->video swap cover
+    duration: Optional[int] = None      # per-image on-screen seconds (NULL = default); ignored for video
 
 
 class PublishPlaylistRequest(BaseModel):     # ← add entire new class

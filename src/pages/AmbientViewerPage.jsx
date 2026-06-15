@@ -15,6 +15,15 @@ const DECODE_SLOW_THRESHOLD_MS = 800;
 const FRAME_STUCK_WARN_MS = 500;
 const LOG_RING_SIZE = 60;
 const DEBUG_TICK_MS = 200;
+// Seamless-loop mode: seek back to 0 this many seconds BEFORE the true end so the decoder never hits
+// end-of-stream (Tizen blanks the plane at `ended`) and never reloads — a gapless loop restart.
+const SINGLE_SEEK_LEAD = 0.15;
+const DEBUG_POST_INTERVAL_MS = 10000;
+// While ?debug is open, EVERY event is buffered and streamed to the backend (full detail, not a
+// rolling window). The buffer survives transient network failures; cap it so a long backend outage
+// can't grow it unbounded, and cap each POST so a catch-up batch stays under the server's body limit.
+const DEBUG_PENDING_CAP = 8000;
+const DEBUG_BATCH_MAX = 1000;
 
 // D2 contingency knob. Only flip to true after on-device evidence that the
 // onended-time frame is consistently unpaintable on a given Tizen firmware.
@@ -41,7 +50,7 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '2.2-poster-freeze';
+const ENGINE_VERSION = '3.0-seamless-loop';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
 
 export function AmbientViewerPage() {
@@ -58,6 +67,13 @@ export function AmbientViewerPage() {
   const [publishing, setPublishing] = useState(false);
   const [, setDebugTick] = useState(0);
 
+  // Seamless-loop mode: the backend pre-built ONE continuous file for the live playlist (or pointed
+  // at a single clip). The viewer plays it on a single <video> and loops via pre-end seek-to-0 — no
+  // src swaps, so no Tizen black gap mid-playlist OR at the loop restart. Live viewing only (preview/
+  // admin keeps the per-item engine for draft content). Falls back to the engine when absent.
+  const playlistVideoUrl = (!isPreview && display && display.playlist_video) ? display.playlist_video : null;
+  const singleVideoMode = !!playlistVideoUrl;
+
   // KEEP refs (from previous implementation, semantics unchanged)
   const mediaRef = useRef([]);
   const currentIdxRef = useRef(0);
@@ -73,6 +89,8 @@ export function AmbientViewerPage() {
   const bridgeCanvasRef = useRef(null);
   const bridgeCtxRef = useRef(null);
   const lastBridgeLumaRef = useRef(-1);  // mean luma of the last canvas capture; <=2 means drawImage is black on this panel
+  const singleVideoRef = useRef(null);   // seamless-loop mode: the single <video> playing the concatenated playlist
+  const lastSingleCtRef = useRef(0);     // tracks currentTime to detect/log the loop wrap
 
   // Engine state
   const stateRef = useRef(STATE_IDLE);
@@ -94,6 +112,9 @@ export function AmbientViewerPage() {
 
   // Diagnostics
   const eventLogRef = useRef([]);
+  const logSeqRef = useRef(0);           // monotonic id per event (ordering/de-dup when streamed)
+  const pendingLogRef = useRef([]);      // every not-yet-confirmed-sent event (debug capture only)
+  const debugSendingRef = useRef(false); // guards overlapping POSTs
   const fpsFramesRef = useRef([]);
   const fpsRateRef = useRef(0);
   const prevRsRef = useRef(-1);
@@ -114,9 +135,16 @@ export function AmbientViewerPage() {
   }, []);
 
   const logEvent = useCallback((klass, msg) => {
-    const ts = fmtTimestamp(performance.now());
-    eventLogRef.current = [{ ts, klass, msg }, ...eventLogRef.current].slice(0, LOG_RING_SIZE);
-  }, [fmtTimestamp]);
+    const seq = (logSeqRef.current += 1);
+    const entry = { seq, ts: fmtTimestamp(performance.now()), at: new Date().toISOString(), klass, msg };
+    eventLogRef.current = [entry, ...eventLogRef.current].slice(0, LOG_RING_SIZE);  // newest-first, for the HUD
+    if (isDebug) {
+      // Buffer EVERY event (chronological) for the backend; capped so a long outage can't grow it forever.
+      const pend = pendingLogRef.current;
+      pend.push(entry);
+      if (pend.length > DEBUG_PENDING_CAP) pend.splice(0, pend.length - DEBUG_PENDING_CAP);
+    }
+  }, [fmtTimestamp, isDebug]);
 
   const goState = useCallback((next) => {
     const prev = stateRef.current;
@@ -279,6 +307,10 @@ export function AmbientViewerPage() {
             (withPoster < vids.length ? ' — run server.backfill_posters' : ''),
         );
       } else {
+        // Keep `display` live (orientation/announcement/playlist_video) so seamless-loop mode picks
+        // up a newly-built concat immediately; MEDIA changes still go through the engine's pending
+        // swap path so a transition isn't interrupted by a remount.
+        setDisplay(data);
         pendingDataRef.current = { display: data, media: filteredMedia };
       }
     } catch (err) {
@@ -878,6 +910,7 @@ export function AmbientViewerPage() {
   /* ----------------------------- AUTOSTART EFFECT --------------------------- */
 
   useEffect(() => {
+    if (singleVideoMode) return;  // seamless-loop mode handles playback; the per-item engine stays idle
     if (stateRef.current !== STATE_IDLE) return;
     if (!display || media.length === 0) return;
     if (!videoRef.current || !imageARef.current || !imageBRef.current || !bridgeCanvasRef.current) return;
@@ -887,7 +920,100 @@ export function AmbientViewerPage() {
     logEvent('lifecycle', 'mount [img-B]');
     logEvent('lifecycle', 'mount [bridge]');
     start(media[0]);
-  }, [display, media, start, logEvent]);
+  }, [display, media, start, logEvent, singleVideoMode]);
+
+  /* --------------------- SEAMLESS-LOOP MODE (single file) ------------------- */
+
+  // Pre-end seek-to-0: jump back to the start a few frames BEFORE the true end so the decoder never
+  // hits end-of-stream (Tizen blanks the plane at `ended`) and never reloads — gapless loop restart.
+  const handleSingleTimeUpdate = useCallback(() => {
+    const v = singleVideoRef.current;
+    if (!v) return;
+    const d = v.duration;
+    const ct = v.currentTime;
+    if (isFinite(d) && d > 0 && ct >= d - SINGLE_SEEK_LEAD) {
+      try { v.currentTime = 0; } catch (_) { /* ignore */ }
+      if (isDebug) logEvent('success', `pre-end seek → 0 (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
+    } else if (ct + 0.5 < lastSingleCtRef.current && isDebug) {
+      // A wrap we did NOT drive (native loop / ended) — log it so the HUD reveals any residual seam.
+      logEvent('lifecycle', `=== loop wrap (ct ${lastSingleCtRef.current.toFixed(1)}→${ct.toFixed(2)}) ===`);
+    }
+    lastSingleCtRef.current = ct;
+  }, [isDebug, logEvent]);
+
+  const handleSingleEnded = useCallback(() => {
+    // Backstop if the pre-end seek was missed: restart WITHOUT load() (no decoder teardown).
+    const v = singleVideoRef.current;
+    if (!v) return;
+    if (isDebug) logEvent('warn', 'single ended — restart via seek (pre-end seek missed)');
+    try { v.currentTime = 0; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+  }, [isDebug, logEvent]);
+
+  const handleSingleError = useCallback(() => {
+    const v = singleVideoRef.current;
+    errorCountRef.current += 1;
+    logEvent('error', `single-video error code=${v?.error?.code ?? '?'}`);
+  }, [logEvent]);
+
+  useEffect(() => {
+    if (!singleVideoMode) return;
+    const v = singleVideoRef.current;
+    if (!v) return;
+    if (v.dataset.url !== playlistVideoUrl) {
+      v.dataset.url = playlistVideoUrl;
+      lastSingleCtRef.current = 0;
+      v.src = playlistVideoUrl;
+      v.load();
+      if (isDebug) logEvent('state', `MODE seamless-loop · src ${basename(playlistVideoUrl)}`);
+    }
+    const p = v.play();
+    if (p && typeof p.then === 'function') {
+      p.catch((e) => logEvent('error', `single play() rejected: ${e?.name ?? 'Error'}`));
+    }
+  }, [singleVideoMode, playlistVideoUrl, isDebug, logEvent]);
+
+  // Stream the on-panel ?debug log to the backend (readable at /api/ambient/<id>/debug-log/latest —
+  // no need to photograph the TV). Sends EVERY buffered event in chronological batches; on a confirmed
+  // POST the sent events are dropped, otherwise they're kept and retried next tick (survives blips).
+  // Never throws into playback.
+  useEffect(() => {
+    if (!isDebug) return;
+    const send = async () => {
+      if (debugSendingRef.current) return;
+      const batch = pendingLogRef.current.slice(0, DEBUG_BATCH_MAX);  // chronological (pushed in order)
+      const lastSeq = batch.length ? batch[batch.length - 1].seq : 0;
+      const vv = singleVideoMode ? singleVideoRef.current : videoRef.current;
+      const header = {
+        mode: singleVideoMode ? 'seamless-loop' : 'per-item-engine',
+        state: stateRef.current,
+        item: singleVideoMode ? basename(playlistVideoUrl) : basename(mediaRef.current[currentIdxRef.current]?.file_path),
+        rs: vv?.readyState, ns: vv?.networkState,
+        ct: vv && isFinite(vv.currentTime) ? +vv.currentTime.toFixed(2) : null,
+        dur: vv && isFinite(vv.duration) ? +vv.duration.toFixed(2) : null,
+        paused: vv ? vv.paused : null,
+        errors: errorCountRef.current,
+        fps: fpsRateRef.current,
+        lastSwapMs: lastSwapMsRef.current,
+        pending: pendingLogRef.current.length,
+      };
+      debugSendingRef.current = true;
+      try {
+        const res = await api.postAmbientDebugLog(id, {
+          engine: ENGINE_VERSION, build: BUILD_STAMP, url: window.location.href, header, events: batch,
+        });
+        if (res && res.ok && lastSeq) {
+          pendingLogRef.current = pendingLogRef.current.filter((e) => e.seq > lastSeq);
+        }
+      } catch {
+        /* keep the batch buffered; retried next tick */
+      } finally {
+        debugSendingRef.current = false;
+      }
+    };
+    send();
+    const handle = setInterval(send, DEBUG_POST_INTERVAL_MS);
+    return () => { clearInterval(handle); send(); };  // best-effort final flush
+  }, [isDebug, id, singleVideoMode, playlistVideoUrl]);
 
   /* -------------------------------- CLEANUP --------------------------------- */
 
@@ -1023,8 +1149,10 @@ export function AmbientViewerPage() {
     : stateRef.current === STATE_PLAYING ? '#7f7'
     : '#888';
   const currentItem = mediaRef.current[currentIdxRef.current];
-  const currentName = currentItem ? basename(currentItem.file_path) : '—';
-  const v = videoRef.current;
+  const currentName = singleVideoMode
+    ? basename(playlistVideoUrl)
+    : (currentItem ? basename(currentItem.file_path) : '—');
+  const v = singleVideoMode ? singleVideoRef.current : videoRef.current;
   const rs = v?.readyState ?? '?';
   const ns = v?.networkState ?? '?';
   const ct = v ? v.currentTime.toFixed(2) : '0.00';
@@ -1046,52 +1174,80 @@ export function AmbientViewerPage() {
       }}
     >
       <div style={containerStyle}>
-        <video
-          ref={videoRef}
-          muted
-          playsInline
-          preload="auto"
-          style={{
-            position: 'absolute',
-            inset: 0,
-            width: '100%',
-            height: '100%',
-            objectFit: 'cover',
-            opacity: 0,
-            transition: 'none',
-            zIndex: 1,
-            willChange: 'opacity',
-            background: '#000',
-          }}
-          onEnded={handleVideoEnded}
-          onError={handleVideoError}
-          onPlaying={handleVideoPlaying}
-          onPause={handleVideoPause}
-          onLoadStart={handleVideoLoadStart}
-          onLoadedData={handleVideoLoadedData}
-          onLoadedMetadata={handleVideoLoadedMetadata}
-          onCanPlay={handleVideoCanPlay}
-          onCanPlayThrough={handleVideoCanPlayThrough}
-          onTimeUpdate={handleVideoTimeUpdate}
-          onSeeked={handleVideoSeeked}
-        />
-        <img ref={imageARef} alt="" style={layerStyle(2)} />
-        <img ref={imageBRef} alt="" style={layerStyle(2)} />
-        <canvas
-          ref={bridgeCanvasRef}
-          style={{
-            position: 'absolute',
-            inset: 0,
-            width: '100%',
-            height: '100%',
-            opacity: 0,
-            zIndex: 3,
-            pointerEvents: 'none',
-            willChange: 'opacity',
-          }}
-        />
-        {/* Last-frame poster cover for video->video swaps (z=3, above the canvas at equal z). */}
-        <img ref={posterRef} alt="" style={layerStyle(3)} />
+        {singleVideoMode ? (
+          /* Seamless-loop mode: ONE <video> plays the whole concatenated playlist. No src swaps →
+             no Tizen black gap between items; the pre-end seek-to-0 watchdog makes the loop restart
+             gapless too. `loop` is kept only as a backstop (the watchdog fires first). */
+          <video
+            ref={singleVideoRef}
+            muted
+            playsInline
+            autoPlay
+            loop
+            preload="auto"
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              zIndex: 1,
+              background: '#000',
+            }}
+            onTimeUpdate={handleSingleTimeUpdate}
+            onEnded={handleSingleEnded}
+            onError={handleSingleError}
+          />
+        ) : (
+          <>
+            <video
+              ref={videoRef}
+              muted
+              playsInline
+              preload="auto"
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                objectFit: 'cover',
+                opacity: 0,
+                transition: 'none',
+                zIndex: 1,
+                willChange: 'opacity',
+                background: '#000',
+              }}
+              onEnded={handleVideoEnded}
+              onError={handleVideoError}
+              onPlaying={handleVideoPlaying}
+              onPause={handleVideoPause}
+              onLoadStart={handleVideoLoadStart}
+              onLoadedData={handleVideoLoadedData}
+              onLoadedMetadata={handleVideoLoadedMetadata}
+              onCanPlay={handleVideoCanPlay}
+              onCanPlayThrough={handleVideoCanPlayThrough}
+              onTimeUpdate={handleVideoTimeUpdate}
+              onSeeked={handleVideoSeeked}
+            />
+            <img ref={imageARef} alt="" style={layerStyle(2)} />
+            <img ref={imageBRef} alt="" style={layerStyle(2)} />
+            <canvas
+              ref={bridgeCanvasRef}
+              style={{
+                position: 'absolute',
+                inset: 0,
+                width: '100%',
+                height: '100%',
+                opacity: 0,
+                zIndex: 3,
+                pointerEvents: 'none',
+                willChange: 'opacity',
+              }}
+            />
+            {/* Last-frame poster cover for video->video swaps (z=3, above the canvas at equal z). */}
+            <img ref={posterRef} alt="" style={layerStyle(3)} />
+          </>
+        )}
 
         {isDebug && (
           <div
@@ -1114,10 +1270,15 @@ export function AmbientViewerPage() {
             }}
           >
             <div style={{ color: '#0ff', fontWeight: 700 }}>v{ENGINE_VERSION} · {BUILD_STAMP}</div>
+            <div style={{ color: singleVideoMode ? '#7f7' : '#ff7', fontWeight: 700 }}>
+              MODE: {singleVideoMode ? 'seamless-loop ✓' : 'per-item engine (fallback)'}
+            </div>
             <div style={{ color: stateColor, fontWeight: 700 }}>STATE: {stateRef.current}</div>
             <div>ITEM:  {currentName} ({ct}s / {dur}s)</div>
             <div>rs={rs} ns={ns} ct={ct} paused={paused} muted={muted}</div>
-            <div>BRIDGE: {bridgeOn ? 'on' : 'off'}    PREFETCH: {prefetchNameRef.current} ({prefetchStatusRef.current})</div>
+            {!singleVideoMode && (
+              <div>BRIDGE: {bridgeOn ? 'on' : 'off'}    PREFETCH: {prefetchNameRef.current} ({prefetchStatusRef.current})</div>
+            )}
             <div>
               ERRORS: <span style={{ color: errorCountRef.current > 0 ? '#f77' : '#7f7' }}>{errorCountRef.current}</span>
               {'   '}LAST-SWAP: {lastSwapMsRef.current}ms

@@ -41,6 +41,8 @@ CREATE TABLE IF NOT EXISTS ambient_displays (
     announcement_name     TEXT    DEFAULT '',
     announcement_title    TEXT    DEFAULT '',
     announcement_enabled  INTEGER NOT NULL DEFAULT 0,
+    playlist_video_path   TEXT    DEFAULT NULL,
+    playlist_video_sig    TEXT    DEFAULT NULL,
     created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 
@@ -53,6 +55,7 @@ CREATE TABLE IF NOT EXISTS ambient_media (
     sort_order          INTEGER NOT NULL DEFAULT 0,
     status              TEXT    NOT NULL DEFAULT 'draft',
     poster_path         TEXT    DEFAULT NULL,
+    duration            INTEGER DEFAULT NULL,   -- per-image on-screen seconds (NULL = default); ignored for video
     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
 );
 

@@ -32,6 +32,9 @@ def init_db():
     # IF NOT EXISTS never alters an existing table). Safe to run on every startup.
     for stmt in (
         "ALTER TABLE ambient_media ADD COLUMN poster_path TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_media ADD COLUMN duration INTEGER DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN playlist_video_path TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN playlist_video_sig TEXT DEFAULT NULL",
     ):
         try:
             conn.execute(stmt)
