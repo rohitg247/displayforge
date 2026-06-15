@@ -836,3 +836,102 @@ claims. Pre-concatenating clips into one file (a known alternative) was consider
 log `cover: poster (last frame)` and freeze the last frame (no black, no fade); no `cover: bridge
 BLACK` once posters exist. Upload a fade-to-black clip → its `*-poster.jpg` is the last BRIGHT frame
 (stdout luma log confirms).
+
+---
+
+## 2026-06-14 — Engine v3.0: seamless-loop (single continuous file) + TV→URL debug-log capture
+
+**Files:** `src/pages/AmbientViewerPage.jsx`, `src/services/api.js`, `server/media_utils.py`,
+`server/routers/ambient_router.py`, `server/database.py`, `server/schema.sql`, `migrate.py`,
+`server/backfill_posters.py`.
+
+### Why (corrected root cause)
+On the real Samsung panel the per-item poster masking (v2.2) still showed black, and the user
+clarified the real, persistent symptom: **mid-playlist was fine in the base version; the black is the
+playlist RESTART (last item → first item)** — and the current masking even regressed mid-playlist.
+Tizen-specific causes (confirmed: signageOS / NowSignage / Samsung video-element docs / aframe #3209):
+1. **Decoder re-init at the wrap** — wrapping to index 0 RE-`load()`s the first clip on Tizen's single
+   hardware decoder → the plane blanks ~1.3–1.6 s.
+2. **End-of-stream blank** — even a single `<video loop>` can flash "right before restarting" because
+   the decoder hits `ended` (plane blanks) before it seeks back.
+
+Every prior round tried to *mask* a per-item gap. This round **removes the gap**: play the whole
+playlist as ONE continuous file and loop it WITHOUT a reload and WITHOUT hitting end-of-stream.
+
+### The fix — one continuous loop file + pre-end seek-to-0 (no quality loss)
+**Backend — `build_playlist_video` (`server/media_utils.py`)**: joins the live playlist into one file
+with ffmpeg's **concat demuxer `-c copy` (zero re-encode of the joined stream)**. Per-segment policy
+(user-approved "re-encode only the odd clips"):
+- conforming clips (share the dominant H.264/yuv420p geometry, checked via `ffprobe` `_probe_stream`)
+  are **stream-copied byte-for-byte** (`_remux_copy_segment`, only audio stripped — lossless);
+- still images are encoded once (`_encode_segment`, CRF 16 visually-lossless — no motion to degrade);
+- a non-conforming video is re-encoded once to the target spec.
+Target spec = most common in-ceiling geometry/fps so the MOST clips copy (`_pick_target_spec`). Output
+has closed-GOP IDR keyframes (`_GOP_ARGS`) so frame 0 is a keyframe → instant seek-to-0. Temp segments
+live in a `TemporaryDirectory`; safe-by-construction (writes only `dst`, never raises, returns bool).
+
+**Backend wiring (`ambient_router.py` + schema)**: new `ambient_displays.playlist_video_path` /
+`playlist_video_sig` columns (`schema.sql`, idempotent ALTER in `database.py` `init_db()`, `migrate.py`).
+`_regenerate_playlist_video(db, display_id)` rebuilds the LIVE playlist's file after
+`publish_playlist` / `reorder_ambient_media` / `delete_ambient_media`; idempotent via a stable sha1
+`sig`; content-addressed filename `ambient-<id>-playlist-<sig>.mp4`. **Single-item refinement:** one
+live video → point `playlist_video_path` straight at that clip's URL (no build — one file already);
+one image / empty → NULL. `_is_built_concat` + `_unlink_upload` guard stale-file cleanup so a real
+clip is never deleted (also fixed in the display-delete path). `get_ambient_display` returns
+`playlist_video` for LIVE viewing only (admin/preview keeps the per-item engine on draft content).
+`backfill_posters.py` gains `--playlist-videos` to build files for existing displays without
+re-publishing.
+
+**Frontend (`AmbientViewerPage.jsx`, engine `3.0-seamless-loop`)**: when `display.playlist_video` is
+present it renders ONE `<video muted playsInline autoplay loop>` (no per-item engine). **Pre-end
+seek-to-0 watchdog** (`handleSingleTimeUpdate`): when `currentTime >= duration - SINGLE_SEEK_LEAD`
+(0.15 s) it sets `currentTime = 0` (NO `load()`), so the decoder never reaches `ended` and never
+reloads → gapless restart. `loop` + an `onEnded`→seek backstop cover a missed watchdog. The HUD shows
+`MODE: seamless-loop ✓` vs `per-item engine (fallback)` so a build failure is never silent. The
+per-item engine is kept untouched as the automatic fallback (build failed / all-image / old backend).
+
+### Part 2 — TV→URL debug-log capture (diagnose without watching the panel)
+- `POST /api/ambient/{id}/debug-log` (text/plain body → no CORS preflight from the TV) stores the
+  viewer's event-log ring + HUD header to `<DB dir>/debug-logs/ambient-<id>-<ts>.json` (+ `-latest`,
+  newest 20 kept). `GET /api/ambient/{id}/debug-log/latest` returns it as **plain text, no-cache**.
+- `api.postAmbientDebugLog` posts every 10 s when `?debug=true`. Retrieval: open
+  `http://<tv-host>:8888/api/ambient/<id>/debug-log/latest` on a laptop → select-all → paste.
+
+### Verify
+- `npm run lint` + `npm run build` green; `python -m py_compile` of the changed backend files OK.
+- Panel `?debug=true`, 5+ loops incl. the restart: HUD `MODE: seamless-loop ✓`, repeated
+  `pre-end seek → 0`, **no black at `=== loop wrap ===`**, `ERRORS: 0`. Confirm the built file is a
+  stream copy (`ffprobe` shows the source codec; conforming clips not re-encoded).
+
+### Deploy
+`docker compose up -d --build backend` → `docker compose exec backend python -m server.backfill_posters --playlist-videos`
+(builds the loop file for existing displays) → rebuild frontend. New publishes rebuild automatically.
+
+### Future-proofing (same session, non-breaking)
+- **Audio is no longer permanently stripped — it's a switch.** `build_playlist_video(..., include_audio=)`
+  threads through `_remux_copy_segment` / `_encode_segment`: default OFF (the player is muted; segments
+  stay video-only for a clean `-c copy`). Set env **`AMBIENT_PLAYLIST_AUDIO=true`** to keep audio — the
+  builder then gives images/silent clips a synthesised AAC track and re-encodes only audio (the **video
+  is still stream-copied losslessly**), so every segment stays concat-compatible. No code change to
+  enable. (The viewer `<video>` is still `muted` for autoplay; unmuting is a separate future step.)
+- **Per-image duration field (settable at upload).** New nullable `ambient_media.duration` column
+  (seconds; NULL → default `AMBIENT_IMAGE_SECONDS`=5). `get_ambient_display` returns it;
+  `build_playlist_video` bakes each image segment to `it.duration or default`. The upload endpoint
+  accepts an OPTIONAL `durations` form field (comma-separated, aligned to files) — the current UI sends
+  nothing (all NULL, unchanged behavior); a future upload UI can set per-image seconds without any
+  endpoint change. The concat `sig` includes duration + audio mode, so changing either rebuilds the
+  loop file. (The per-item fallback engine still uses its fixed constant; the seamless-loop path — what
+  runs in production — honors the per-image duration.)
+
+### Debug-log capture upgraded to a full, retained, timestamped transcript
+Was a rolling 60-event snapshot overwritten each POST. Now, while `?debug=true` is open, the viewer
+buffers **every** event (chronological, with a per-event `seq` + ISO wall-clock `at`) and streams them
+in batches; on a confirmed POST the sent events are dropped, otherwise kept and retried (survives
+network blips). Capped buffers (`DEBUG_PENDING_CAP` 8000, `DEBUG_BATCH_MAX` 1000/POST) bound memory and
+body size. The backend appends them to **one file per display per day**
+(`ambient-<id>-<YYYY-MM-DD>.log`) — full detail, wall-clock timestamps — and **prunes day-files older
+than 7 days** (`_DEBUG_LOG_RETENTION_DAYS`), so file count is bounded (no per-snapshot explosion).
+`GET …/debug-log/latest` returns the most recent day's full transcript (status header + events,
+tail-capped to ~2 MB); `?date=YYYY-MM-DD` views any retained day, and the response lists available days.
+Capture happens ONLY when `?debug=true` (the viewer only buffers/sends in that mode). The on-panel
+HUD still shows the live last-60 ring; the full history lives server-side.
