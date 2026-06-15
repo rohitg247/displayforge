@@ -34,3 +34,6 @@ backend_data/
 server/routers/__pycache__/
 __pycache__/
 *.pyc
+
+# Scratch planning notes (working docs; not part of the repo)
+plan.md
