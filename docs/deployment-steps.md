@@ -73,14 +73,16 @@ docker compose exec backend ffprobe -v error -show_entries stream=codec_name,wid
 - let it run **5+ full loops including the restart**: the log shows repeated **`pre-end seek → 0`** and
   **no black** at the loop wrap; `ERRORS: 0`.
 
-**e. Read the on-panel log without watching the TV** — open in any browser on the same network:
+**e. Read the on-panel log without watching the TV** — open in any browser on the same network, at the
+SAME origin + URL pattern as the viewer (just swap `?debug=true` for `/debug-log/latest`):
 ```
-http://<tv-host>:8888/api/ambient/<display-id>/debug-log/latest
+http://<host>:3200/<branchId>/2/<displayId>/debug-log/latest
 ```
-(plain text; select-all → copy). It streams the FULL detailed transcript while the viewer runs with
-`?debug=true`, updating every ~10 s. One append-only file per day is kept; logs older than **7 days**
-are pruned automatically. Add `?date=YYYY-MM-DD` to view an earlier retained day (the page lists the
-available days). Capture only happens while a panel has `?debug=true` open.
+e.g. for viewer `http://10.1.1.236:3200/2/2/4?debug=true` → `http://10.1.1.236:3200/2/2/4/debug-log/latest`.
+It renders the FULL transcript (auto-refreshing ~10 s) while the viewer runs with `?debug=true`. One
+append-only file per day is kept; logs older than **7 days** are pruned automatically. Add
+`?date=YYYY-MM-DD` to view an earlier retained day. Capture only happens while a panel has `?debug=true`
+open. (The page fetches from the backend via `VITE_API_URL` under the hood — no hardcoded port.)
 
 ---
 

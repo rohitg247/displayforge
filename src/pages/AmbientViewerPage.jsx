@@ -16,8 +16,10 @@ const FRAME_STUCK_WARN_MS = 500;
 const LOG_RING_SIZE = 60;
 const DEBUG_TICK_MS = 200;
 // Seamless-loop mode: seek back to 0 this many seconds BEFORE the true end so the decoder never hits
-// end-of-stream (Tizen blanks the plane at `ended`) and never reloads — a gapless loop restart.
-const SINGLE_SEEK_LEAD = 0.15;
+// end-of-stream (Tizen blanks the plane at `ended`) and never reloads — a gapless loop restart. Driven
+// by a per-frame rAF watchdog (NOT `timeupdate`, which Tizen fires too coarsely — ~250ms — to ever catch
+// a 0.15s window); 0.25s gives the rAF poll comfortable margin while trimming an invisible tail.
+const SINGLE_SEEK_LEAD = 0.25;
 const DEBUG_POST_INTERVAL_MS = 10000;
 // While ?debug is open, EVERY event is buffered and streamed to the backend (full detail, not a
 // rolling window). The buffer survives transient network failures; cap it so a long backend outage
@@ -91,6 +93,10 @@ export function AmbientViewerPage() {
   const lastBridgeLumaRef = useRef(-1);  // mean luma of the last canvas capture; <=2 means drawImage is black on this panel
   const singleVideoRef = useRef(null);   // seamless-loop mode: the single <video> playing the concatenated playlist
   const lastSingleCtRef = useRef(0);     // tracks currentTime to detect/log the loop wrap
+  const singleRafRef = useRef(null);     // rAF handle for the seamless-loop restart watchdog
+  const singleActiveRef = useRef(false); // true while the watchdog should keep rescheduling itself
+  const wrappingRef = useRef(false);     // guards one seek-to-0 per loop cycle (shared by rAF + timeupdate)
+  const endRecoverRef = useRef(null);    // timer handle for the load()+play() last-resort recovery
 
   // Engine state
   const stateRef = useRef(STATE_IDLE);
@@ -924,30 +930,81 @@ export function AmbientViewerPage() {
 
   /* --------------------- SEAMLESS-LOOP MODE (single file) ------------------- */
 
-  // Pre-end seek-to-0: jump back to the start a few frames BEFORE the true end so the decoder never
-  // hits end-of-stream (Tizen blanks the plane at `ended`) and never reloads — gapless loop restart.
+  // Seamless-loop restart, hardened for Tizen (coarse `timeupdate`, ignored `loop`, no resume after
+  // `ended`). A per-frame rAF watchdog drives a pre-end seek-to-0 on the SAME playing element — no
+  // load(), no src swap → the decoder is never torn down → no black at the wrap (the concat file has an
+  // IDR keyframe at frame 0, so the seek repaints instantly). load()+play() is only a last resort if the
+  // element actually stalls at the end.
+  const singleForceRestart = useCallback(() => {
+    const v = singleVideoRef.current;
+    if (!v) return;
+    if (endRecoverRef.current) return; // a recovery is already in flight
+    if (isDebug) logEvent('warn', 'stuck-at-end force restart');
+    try {
+      v.currentTime = 0;
+      const p = v.play();
+      if (p && p.catch) p.catch(() => {});
+    } catch (_) { /* ignore */ }
+    // If seek+play didn't get us moving within ~500ms, reload once (a single brief blip beats a
+    // permanent freeze). Should never fire once the rAF pre-end seek is working.
+    endRecoverRef.current = setTimeout(() => {
+      endRecoverRef.current = null;
+      const vv = singleVideoRef.current;
+      if (!vv) return;
+      if (vv.ended || vv.paused || vv.currentTime < 0.05) {
+        if (isDebug) logEvent('error', 'ended fallback load()');
+        try { vv.load(); const p = vv.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+      }
+      wrappingRef.current = false;
+    }, 500);
+  }, [isDebug, logEvent]);
+
+  const singleLoopTick = useCallback(() => {
+    if (!singleActiveRef.current) { singleRafRef.current = null; return; }
+    const v = singleVideoRef.current;
+    if (v) {
+      const d = v.duration;
+      const ct = v.currentTime;
+      // Release the per-cycle guard once we're safely back near the start.
+      if (wrappingRef.current && ct < 1 && !v.ended) wrappingRef.current = false;
+      if (isFinite(d) && d > 0) {
+        if (v.ended || (ct >= d - 0.05 && v.paused)) {
+          singleForceRestart();                       // stalled at the end — recover
+        } else if (!wrappingRef.current && ct >= d - SINGLE_SEEK_LEAD) {
+          wrappingRef.current = true;
+          try { v.currentTime = 0; } catch (_) { /* ignore */ }
+          if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } // Tizen can pause on seek
+          if (isDebug) logEvent('success', `rAF pre-end seek → 0 (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
+        }
+      }
+      lastSingleCtRef.current = ct;
+    }
+    singleRafRef.current = requestAnimationFrame(singleLoopTick);
+  }, [isDebug, logEvent, singleForceRestart]);
+
+  // `timeupdate` kept only as a low-frequency backstop (shares the wrappingRef guard so it never
+  // double-seeks with the rAF watchdog) and to log any wrap we did not drive.
   const handleSingleTimeUpdate = useCallback(() => {
     const v = singleVideoRef.current;
     if (!v) return;
     const d = v.duration;
     const ct = v.currentTime;
-    if (isFinite(d) && d > 0 && ct >= d - SINGLE_SEEK_LEAD) {
+    if (!wrappingRef.current && isFinite(d) && d > 0 && ct >= d - SINGLE_SEEK_LEAD) {
+      wrappingRef.current = true;
       try { v.currentTime = 0; } catch (_) { /* ignore */ }
-      if (isDebug) logEvent('success', `pre-end seek → 0 (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
+      if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+      if (isDebug) logEvent('success', `pre-end seek → 0 (timeupdate) (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
     } else if (ct + 0.5 < lastSingleCtRef.current && isDebug) {
-      // A wrap we did NOT drive (native loop / ended) — log it so the HUD reveals any residual seam.
       logEvent('lifecycle', `=== loop wrap (ct ${lastSingleCtRef.current.toFixed(1)}→${ct.toFixed(2)}) ===`);
     }
     lastSingleCtRef.current = ct;
   }, [isDebug, logEvent]);
 
   const handleSingleEnded = useCallback(() => {
-    // Backstop if the pre-end seek was missed: restart WITHOUT load() (no decoder teardown).
-    const v = singleVideoRef.current;
-    if (!v) return;
-    if (isDebug) logEvent('warn', 'single ended — restart via seek (pre-end seek missed)');
-    try { v.currentTime = 0; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
-  }, [isDebug, logEvent]);
+    // We try never to reach `ended` (the rAF/timeupdate seek wraps first); if we do, recover robustly.
+    if (isDebug) logEvent('warn', 'single ended — recovering');
+    singleForceRestart();
+  }, [isDebug, logEvent, singleForceRestart]);
 
   const handleSingleError = useCallback(() => {
     const v = singleVideoRef.current;
@@ -971,6 +1028,19 @@ export function AmbientViewerPage() {
       p.catch((e) => logEvent('error', `single play() rejected: ${e?.name ?? 'Error'}`));
     }
   }, [singleVideoMode, playlistVideoUrl, isDebug, logEvent]);
+
+  // Run the frame-accurate loop-restart watchdog only while in seamless mode; tear it down on exit.
+  useEffect(() => {
+    if (!singleVideoMode) return;
+    singleActiveRef.current = true;
+    singleRafRef.current = requestAnimationFrame(singleLoopTick);
+    return () => {
+      singleActiveRef.current = false;
+      if (singleRafRef.current) { cancelAnimationFrame(singleRafRef.current); singleRafRef.current = null; }
+      if (endRecoverRef.current) { clearTimeout(endRecoverRef.current); endRecoverRef.current = null; }
+      wrappingRef.current = false;
+    };
+  }, [singleVideoMode, singleLoopTick]);
 
   // Stream the on-panel ?debug log to the backend (readable at /api/ambient/<id>/debug-log/latest —
   // no need to photograph the TV). Sends EVERY buffered event in chronological batches; on a confirmed
@@ -999,7 +1069,10 @@ export function AmbientViewerPage() {
       debugSendingRef.current = true;
       try {
         const res = await api.postAmbientDebugLog(id, {
-          engine: ENGINE_VERSION, build: BUILD_STAMP, url: window.location.href, header, events: batch,
+          engine: ENGINE_VERSION, build: BUILD_STAMP,
+          // Point at the same-origin debug-log page (viewer URL + /debug-log/latest), not the raw href.
+          url: `${window.location.origin}${window.location.pathname.replace(/\/+$/, '')}/debug-log/latest`,
+          header, events: batch,
         });
         if (res && res.ok && lastSeq) {
           pendingLogRef.current = pendingLogRef.current.filter((e) => e.seq > lastSeq);

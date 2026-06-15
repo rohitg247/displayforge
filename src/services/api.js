@@ -163,4 +163,13 @@ export const api = {
       method: 'POST',
       body: JSON.stringify(payload),
     }),
+  // Plain-text transcript (not JSON, so it bypasses the JSON `request()` helper). Reuses the same
+  // API_BASE as every other call, so the host/port stays env-driven (VITE_API_URL), never hardcoded.
+  getAmbientDebugLog: (id, date) => {
+    const qs = date ? `?date=${encodeURIComponent(date)}` : '';
+    return fetch(`${API_BASE}/api/ambient/${id}/debug-log/latest${qs}`).then((r) => {
+      if (!r.ok) throw new Error(`HTTP ${r.status}`);
+      return r.text();
+    });
+  },
 };

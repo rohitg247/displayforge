@@ -14,6 +14,7 @@ import { DisplayViewerPage } from "./pages/DisplayViewerPage";
 import { BranchesPage } from "./pages/BranchesPage";
 import { AmbientDisplaysPage } from "./pages/AmbientDisplaysPage";
 import { AmbientViewerPage } from "./pages/AmbientViewerPage";
+import { AmbientDebugLogPage } from "./pages/AmbientDebugLogPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -30,6 +31,7 @@ const App = () => (
             <Route path="/admin/login" element={<LoginPage />} />
             <Route path="/:branchId/1/:id" element={<DisplayViewerPage />} />
             <Route path="/:branchId/2/:id" element={<AmbientViewerPage />} />
+            <Route path="/:branchId/2/:id/debug-log/latest" element={<AmbientDebugLogPage />} />
             <Route
               path="/admin"
               element={
