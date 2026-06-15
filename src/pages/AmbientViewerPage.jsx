@@ -16,10 +16,18 @@ const FRAME_STUCK_WARN_MS = 500;
 const LOG_RING_SIZE = 60;
 const DEBUG_TICK_MS = 200;
 // Seamless-loop mode: seek back to 0 this many seconds BEFORE the true end so the decoder never hits
-// end-of-stream (Tizen blanks the plane at `ended`) and never reloads — a gapless loop restart. Driven
-// by a per-frame rAF watchdog (NOT `timeupdate`, which Tizen fires too coarsely — ~250ms — to ever catch
-// a 0.15s window); 0.25s gives the rAF poll comfortable margin while trimming an invisible tail.
-const SINGLE_SEEK_LEAD = 0.25;
+// end-of-stream (Tizen blanks the plane at `ended`) and never reloads — a gapless, black-free loop
+// restart. A backward seek on the still-playing element BEFORE EOF does NOT tear down the HW decoder
+// (it just jumps to the IDR at frame 0 and keeps presenting), so the seam stays black-free; the ONLY
+// requirement is to land that seek before the stream can end. A 1.5s lead keeps the decoder well away
+// from the fragile end-of-stream boundary and gives the ~100ms setInterval watchdog ~15 attempts to
+// land the seek. The trimmed 1.5s tail is invisible on an endlessly-looping playlist (just slightly
+// shorter each cycle — never black). Polled by setInterval, NOT rAF (Tizen throttles rAF while the
+// HW video plane is composited; setInterval keeps firing).
+const SINGLE_SEEK_LEAD = 1.5;
+const SINGLE_TICK_MS = 100;        // watchdog poll interval (reliable during HW video playback)
+const SINGLE_HEARTBEAT_MS = 2000;  // how often the watchdog logs a ct/dur/paused/ended/rs/ns heartbeat
+const SINGLE_LOAD_BREAKER_MS = 1500; // ct pinned at EOF this long with retries exhausted → load() breaker
 const DEBUG_POST_INTERVAL_MS = 10000;
 // While ?debug is open, EVERY event is buffered and streamed to the backend (full detail, not a
 // rolling window). The buffer survives transient network failures; cap it so a long backend outage
@@ -52,8 +60,18 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '3.0-seamless-loop';
+const ENGINE_VERSION = '3.1-loop-hardened';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
+
+// Both the Samsung panel and a regular browser (laptop/desktop) can open ?debug=true and stream to the
+// SAME day-file, so tag every snapshot/event with its source. Samsung Tizen signage UAs contain
+// "Tizen"/"SMART-TV"; LG webOS / other smart-TV UAs are matched too. Anything else is treated as a
+// laptop/desktop. Computed once per session (the UA never changes mid-session).
+const CLIENT_KIND = (() => {
+  const ua = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
+  return /Tizen|SMART-TV|SmartHub|Web0S|webOS|NetCast|HbbTV|SmartTV/i.test(ua) ? 'TV' : 'laptop';
+})();
+const CLIENT_UA = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
 
 export function AmbientViewerPage() {
   const { id } = useParams();
@@ -93,10 +111,11 @@ export function AmbientViewerPage() {
   const lastBridgeLumaRef = useRef(-1);  // mean luma of the last canvas capture; <=2 means drawImage is black on this panel
   const singleVideoRef = useRef(null);   // seamless-loop mode: the single <video> playing the concatenated playlist
   const lastSingleCtRef = useRef(0);     // tracks currentTime to detect/log the loop wrap
-  const singleRafRef = useRef(null);     // rAF handle for the seamless-loop restart watchdog
-  const singleActiveRef = useRef(false); // true while the watchdog should keep rescheduling itself
-  const wrappingRef = useRef(false);     // guards one seek-to-0 per loop cycle (shared by rAF + timeupdate)
-  const endRecoverRef = useRef(null);    // timer handle for the load()+play() last-resort recovery
+  const singleTickRef = useRef(null);    // setInterval handle for the seamless-loop restart watchdog
+  const wrappingRef = useRef(false);     // true from the pre-end seek until the wrap is confirmed (ct dropped)
+  const wrapStartedAtRef = useRef(0);    // performance.now() when the current wrap attempt began (load()-breaker timer)
+  const lastHeartbeatAtRef = useRef(0);  // performance.now() of the last watchdog heartbeat log
+  const endRecoverRef = useRef(null);    // timer handle for the load()+play() last-resort freeze breaker
 
   // Engine state
   const stateRef = useRef(STATE_IDLE);
@@ -930,60 +949,83 @@ export function AmbientViewerPage() {
 
   /* --------------------- SEAMLESS-LOOP MODE (single file) ------------------- */
 
-  // Seamless-loop restart, hardened for Tizen (coarse `timeupdate`, ignored `loop`, no resume after
-  // `ended`). A per-frame rAF watchdog drives a pre-end seek-to-0 on the SAME playing element — no
-  // load(), no src swap → the decoder is never torn down → no black at the wrap (the concat file has an
-  // IDR keyframe at frame 0, so the seek repaints instantly). load()+play() is only a last resort if the
-  // element actually stalls at the end.
-  const singleForceRestart = useCallback(() => {
+  // Black-free endless loop, hardened for Tizen. The whole live playlist plays as ONE concatenated file
+  // on a single <video>; we loop by seeking back to 0 on the STILL-PLAYING element ~1.5s before EOF.
+  // A backward seek before end-of-stream never tears down the HW decoder (it jumps to the IDR at frame
+  // 0 and keeps presenting), so the seam stays black-free. The ONLY requirement is to land that seek
+  // before the stream can end — so a ~100ms setInterval watchdog (NOT rAF, which Tizen throttles while
+  // the HW video plane is composited) retries the seek every tick until the wrap is confirmed.
+
+  // ABSOLUTE last resort: only reached when the video has ALREADY frozen at EOF and every in-stream
+  // seek retry failed. load()+play() forces a fresh decode — this is the ONLY path that can briefly
+  // flash black, and it exists purely to break a permanent freeze (strictly better than a dead screen).
+  // Once the pre-end seek retry loop works this never runs (no `loop: seek FAILED → load()` in the log).
+  const singleLoadBreaker = useCallback(() => {
     const v = singleVideoRef.current;
     if (!v) return;
-    if (endRecoverRef.current) return; // a recovery is already in flight
-    if (isDebug) logEvent('warn', 'stuck-at-end force restart');
-    try {
-      v.currentTime = 0;
-      const p = v.play();
-      if (p && p.catch) p.catch(() => {});
-    } catch (_) { /* ignore */ }
-    // If seek+play didn't get us moving within ~500ms, reload once (a single brief blip beats a
-    // permanent freeze). Should never fire once the rAF pre-end seek is working.
-    endRecoverRef.current = setTimeout(() => {
-      endRecoverRef.current = null;
-      const vv = singleVideoRef.current;
-      if (!vv) return;
-      if (vv.ended || vv.paused || vv.currentTime < 0.05) {
-        if (isDebug) logEvent('error', 'ended fallback load()');
-        try { vv.load(); const p = vv.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
-      }
-      wrappingRef.current = false;
-    }, 500);
+    if (endRecoverRef.current) return; // a load() is already re-initializing the decoder
+    if (isDebug) logEvent('error', `loop: seek FAILED → load() (ct=${(v.currentTime || 0).toFixed(2)})`);
+    try { v.load(); const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+    wrappingRef.current = false;
+    wrapStartedAtRef.current = 0;
+    // Guard so the watchdog doesn't hammer load() every tick while the decoder re-initializes.
+    endRecoverRef.current = setTimeout(() => { endRecoverRef.current = null; }, 1200);
   }, [isDebug, logEvent]);
 
+  // The ~100ms watchdog. Drives the pre-end seek, retries it every tick until the wrap is confirmed,
+  // emits a periodic heartbeat, and breaks a true freeze as a last resort.
   const singleLoopTick = useCallback(() => {
-    if (!singleActiveRef.current) { singleRafRef.current = null; return; }
     const v = singleVideoRef.current;
-    if (v) {
-      const d = v.duration;
-      const ct = v.currentTime;
-      // Release the per-cycle guard once we're safely back near the start.
-      if (wrappingRef.current && ct < 1 && !v.ended) wrappingRef.current = false;
-      if (isFinite(d) && d > 0) {
-        if (v.ended || (ct >= d - 0.05 && v.paused)) {
-          singleForceRestart();                       // stalled at the end — recover
-        } else if (!wrappingRef.current && ct >= d - SINGLE_SEEK_LEAD) {
-          wrappingRef.current = true;
-          try { v.currentTime = 0; } catch (_) { /* ignore */ }
-          if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } // Tizen can pause on seek
-          if (isDebug) logEvent('success', `rAF pre-end seek → 0 (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
-        }
-      }
-      lastSingleCtRef.current = ct;
-    }
-    singleRafRef.current = requestAnimationFrame(singleLoopTick);
-  }, [isDebug, logEvent, singleForceRestart]);
+    if (!v) return;
+    const d = v.duration;
+    const ct = v.currentTime;
+    const now = performance.now();
 
-  // `timeupdate` kept only as a low-frequency backstop (shares the wrappingRef guard so it never
-  // double-seeks with the rAF watchdog) and to log any wrap we did not drive.
+    // Heartbeat: periodic snapshot so the approach-to-EOF and any freeze are visible in the transcript.
+    if (isDebug && now - lastHeartbeatAtRef.current >= SINGLE_HEARTBEAT_MS) {
+      lastHeartbeatAtRef.current = now;
+      logEvent('verbose',
+        `hb ct=${isFinite(ct) ? ct.toFixed(2) : '?'} dur=${isFinite(d) ? d.toFixed(2) : '?'} ` +
+        `paused=${v.paused} ended=${v.ended} rs=${v.readyState} ns=${v.networkState}`);
+    }
+
+    if (isFinite(d) && d > 0) {
+      if (wrappingRef.current) {
+        // A wrap is in progress: confirm it (ct dropped) or keep nudging the seek until it lands.
+        if (ct < 1 && !v.ended) {
+          if (isDebug) logEvent('success', `loop: wrap CONFIRMED (ct=${ct.toFixed(2)})`);
+          wrappingRef.current = false;
+          wrapStartedAtRef.current = 0;
+        } else if (now - wrapStartedAtRef.current >= SINGLE_LOAD_BREAKER_MS) {
+          // Stream reached/passed EOF and never honored the seek — break the freeze (may flash once).
+          singleLoadBreaker();
+        } else {
+          // Still before EOF but the seek hasn't taken yet — retry every tick (the no-black guarantee).
+          try { v.currentTime = 0; } catch (_) { /* ignore */ }
+          const p = v.play(); if (p && p.catch) p.catch(() => {});
+          if (isDebug) logEvent('warn', `loop: seek retry (ct=${ct.toFixed(2)})`);
+        }
+      } else if (v.ended) {
+        // Reached EOF without catching the pre-end window (shouldn't happen with a 1.5s lead). Recover.
+        wrappingRef.current = true;
+        wrapStartedAtRef.current = now;
+        try { v.currentTime = 0; } catch (_) { /* ignore */ }
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+        if (isDebug) logEvent('warn', `loop: ended caught in tick → seek→0 (ct=${ct.toFixed(2)})`);
+      } else if (ct >= d - SINGLE_SEEK_LEAD) {
+        // Pre-end window: seek to 0 on the still-playing element BEFORE EOF → black-free wrap.
+        wrappingRef.current = true;
+        wrapStartedAtRef.current = now;
+        try { v.currentTime = 0; } catch (_) { /* ignore */ }
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+        if (isDebug) logEvent('success', `loop: seek→0 requested (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
+      }
+    }
+    lastSingleCtRef.current = ct;
+  }, [isDebug, logEvent, singleLoadBreaker]);
+
+  // `timeupdate` is a secondary trigger only (the setInterval watchdog is primary). Shares wrappingRef
+  // so it can't double-seek; also logs a native wrap we didn't drive (shouldn't occur without `loop`).
   const handleSingleTimeUpdate = useCallback(() => {
     const v = singleVideoRef.current;
     if (!v) return;
@@ -991,20 +1033,77 @@ export function AmbientViewerPage() {
     const ct = v.currentTime;
     if (!wrappingRef.current && isFinite(d) && d > 0 && ct >= d - SINGLE_SEEK_LEAD) {
       wrappingRef.current = true;
+      wrapStartedAtRef.current = performance.now();
       try { v.currentTime = 0; } catch (_) { /* ignore */ }
-      if (v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
-      if (isDebug) logEvent('success', `pre-end seek → 0 (timeupdate) (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
-    } else if (ct + 0.5 < lastSingleCtRef.current && isDebug) {
-      logEvent('lifecycle', `=== loop wrap (ct ${lastSingleCtRef.current.toFixed(1)}→${ct.toFixed(2)}) ===`);
+      const p = v.play(); if (p && p.catch) p.catch(() => {});
+      if (isDebug) logEvent('success', `loop: seek→0 requested (timeupdate) (ct=${ct.toFixed(2)}/${d.toFixed(2)})`);
+    } else if (!wrappingRef.current && ct + 0.5 < lastSingleCtRef.current && isDebug) {
+      logEvent('lifecycle', `=== native wrap (ct ${lastSingleCtRef.current.toFixed(1)}→${ct.toFixed(2)}) ===`);
     }
     lastSingleCtRef.current = ct;
   }, [isDebug, logEvent]);
 
   const handleSingleEnded = useCallback(() => {
-    // We try never to reach `ended` (the rAF/timeupdate seek wraps first); if we do, recover robustly.
-    if (isDebug) logEvent('warn', 'single ended — recovering');
-    singleForceRestart();
-  }, [isDebug, logEvent, singleForceRestart]);
+    // With `loop` removed this fires reliably at EOF. The 1.5s pre-end seek should mean we almost never
+    // get here; if we do, route recovery through the watchdog (it confirms the wrap or breaks the freeze).
+    const v = singleVideoRef.current;
+    if (isDebug) logEvent('warn', `single ended → recover (ct=${v ? (v.currentTime || 0).toFixed(2) : '?'})`);
+    if (!v) return;
+    wrappingRef.current = true;
+    wrapStartedAtRef.current = performance.now();
+    try { v.currentTime = 0; const p = v.play(); if (p && p.catch) p.catch(() => {}); } catch (_) { /* ignore */ }
+  }, [isDebug, logEvent]);
+
+  // Tizen frequently auto-pauses on a backward seek or buffer underrun — immediately resume so the loop
+  // never stalls (the "didn't auto-play after the first cycle" symptom). Don't fight a genuine EOF pause
+  // (the ended handler + watchdog cover that).
+  const handleSinglePause = useCallback(() => {
+    const v = singleVideoRef.current;
+    if (!v) return;
+    if (isDebug) logEvent('warn', `pause ct=${(v.currentTime || 0).toFixed(2)} → play()`);
+    if (!v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+  }, [isDebug, logEvent]);
+
+  const handleSingleSeeked = useCallback(() => {
+    const v = singleVideoRef.current;
+    if (!v) return;
+    if (isDebug) logEvent('lifecycle', `seeked ct=${(v.currentTime || 0).toFixed(2)}`);
+    if (v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); } // resume after seek
+  }, [isDebug, logEvent]);
+
+  const handleSingleSeeking = useCallback(() => {
+    if (!isDebug) return;
+    const v = singleVideoRef.current;
+    logEvent('lifecycle', `seeking ct=${v ? (v.currentTime || 0).toFixed(2) : '?'}`);
+  }, [isDebug, logEvent]);
+
+  const handleSinglePlaying = useCallback(() => {
+    if (!isDebug) return;
+    const v = singleVideoRef.current;
+    logEvent('success', `playing ct=${v ? (v.currentTime || 0).toFixed(2) : '?'}`);
+  }, [isDebug, logEvent]);
+
+  const handleSingleWaiting = useCallback(() => {
+    if (!isDebug) return;
+    const v = singleVideoRef.current;
+    logEvent('warn', `waiting (buffering) ct=${v ? (v.currentTime || 0).toFixed(2) : '?'}`);
+  }, [isDebug, logEvent]);
+
+  const handleSingleStalled = useCallback(() => {
+    if (!isDebug) return;
+    logEvent('warn', 'stalled');
+  }, [isDebug, logEvent]);
+
+  const handleSingleLoadedMetadata = useCallback(() => {
+    if (!isDebug) return;
+    const v = singleVideoRef.current;
+    logEvent('lifecycle', `loadedmetadata dur=${v && isFinite(v.duration) ? v.duration.toFixed(2) : '?'}`);
+  }, [isDebug, logEvent]);
+
+  const handleSingleLoadedData = useCallback(() => {
+    if (!isDebug) return;
+    logEvent('lifecycle', 'loadeddata (first frame ready)');
+  }, [isDebug, logEvent]);
 
   const handleSingleError = useCallback(() => {
     const v = singleVideoRef.current;
@@ -1029,16 +1128,20 @@ export function AmbientViewerPage() {
     }
   }, [singleVideoMode, playlistVideoUrl, isDebug, logEvent]);
 
-  // Run the frame-accurate loop-restart watchdog only while in seamless mode; tear it down on exit.
+  // Run the loop-restart watchdog only while in seamless mode; tear it down on exit. A setInterval
+  // (not rAF) is used because Tizen throttles requestAnimationFrame while the HW video plane is
+  // composited, which is exactly when we need to poll.
   useEffect(() => {
     if (!singleVideoMode) return;
-    singleActiveRef.current = true;
-    singleRafRef.current = requestAnimationFrame(singleLoopTick);
+    lastHeartbeatAtRef.current = 0;
+    wrappingRef.current = false;
+    wrapStartedAtRef.current = 0;
+    singleTickRef.current = setInterval(singleLoopTick, SINGLE_TICK_MS);
     return () => {
-      singleActiveRef.current = false;
-      if (singleRafRef.current) { cancelAnimationFrame(singleRafRef.current); singleRafRef.current = null; }
+      if (singleTickRef.current) { clearInterval(singleTickRef.current); singleTickRef.current = null; }
       if (endRecoverRef.current) { clearTimeout(endRecoverRef.current); endRecoverRef.current = null; }
       wrappingRef.current = false;
+      wrapStartedAtRef.current = 0;
     };
   }, [singleVideoMode, singleLoopTick]);
 
@@ -1070,6 +1173,9 @@ export function AmbientViewerPage() {
       try {
         const res = await api.postAmbientDebugLog(id, {
           engine: ENGINE_VERSION, build: BUILD_STAMP,
+          // Tag the source so a TV transcript and a laptop transcript (which share the day-file) are
+          // distinguishable both in the status snapshot and per-event line.
+          client: CLIENT_KIND, ua: CLIENT_UA,
           // Point at the same-origin debug-log page (viewer URL + /debug-log/latest), not the raw href.
           url: `${window.location.origin}${window.location.pathname.replace(/\/+$/, '')}/debug-log/latest`,
           header, events: batch,
@@ -1249,14 +1355,14 @@ export function AmbientViewerPage() {
       <div style={containerStyle}>
         {singleVideoMode ? (
           /* Seamless-loop mode: ONE <video> plays the whole concatenated playlist. No src swaps →
-             no Tizen black gap between items; the pre-end seek-to-0 watchdog makes the loop restart
-             gapless too. `loop` is kept only as a backstop (the watchdog fires first). */
+             no Tizen black gap between items; a ~100ms setInterval watchdog seeks to 0 ~1.5s before
+             EOF (on the still-playing element, so no decoder teardown) for a black-free loop restart.
+             NO `loop` attribute: it races with our seek AND suppresses `ended` (disabling recovery). */
           <video
             ref={singleVideoRef}
             muted
             playsInline
             autoPlay
-            loop
             preload="auto"
             style={{
               position: 'absolute',
@@ -1270,6 +1376,14 @@ export function AmbientViewerPage() {
             onTimeUpdate={handleSingleTimeUpdate}
             onEnded={handleSingleEnded}
             onError={handleSingleError}
+            onPause={handleSinglePause}
+            onPlaying={handleSinglePlaying}
+            onSeeking={handleSingleSeeking}
+            onSeeked={handleSingleSeeked}
+            onWaiting={handleSingleWaiting}
+            onStalled={handleSingleStalled}
+            onLoadedMetadata={handleSingleLoadedMetadata}
+            onLoadedData={handleSingleLoadedData}
           />
         ) : (
           <>

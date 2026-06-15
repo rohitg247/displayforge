@@ -596,12 +596,19 @@ async def post_ambient_debug_log(display_id: int, request: Request):
     events = payload.get("events") or []
     _DEBUG_LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Source of this batch: "TV" (Samsung panel) or "laptop" (regular browser). Both can open
+    # ?debug=true and stream to the same day-file, so tag the snapshot and every event line.
+    client = str(payload.get("client") or "?")
+    client_tag = client[:6]  # short, fixed-width prefix for event lines
+
     # Overwritten status snapshot — a quick "right now" view (engine/build/url + live header).
     status = {
         "display_id": display_id,
         "captured_at": now.isoformat(timespec="seconds"),
         "engine": payload.get("engine"),
         "build": payload.get("build"),
+        "client": client,
+        "user_agent": payload.get("ua"),
         "url": payload.get("url"),
         "header": payload.get("header"),
     }
@@ -621,7 +628,7 @@ async def post_ambient_debug_log(display_id: int, request: Request):
             seq = e.get("seq", "")
             klass = e.get("klass", "")
             msg = e.get("msg", "")
-            lines.append(f"{at}  #{seq:<7} [{klass:<9}] {msg}")
+            lines.append(f"{at}  [{client_tag:<6}] #{seq:<7} [{klass:<9}] {msg}")
         if lines:
             with day_file.open("a", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")
