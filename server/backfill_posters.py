@@ -42,7 +42,7 @@ def _backfill_posters(conn, upload_dir) -> None:
             continue
 
         video_disk = upload_dir / Path(r["file_path"]).name
-        poster_name = f"{video_disk.stem}-poster.jpg"
+        poster_name = f"{video_disk.stem}-poster.png"  # lossless cover (matches upload path)
         poster_disk = upload_dir / poster_name
         poster_url = f"/uploads/{poster_name}"
 
@@ -91,13 +91,20 @@ def _normalize_existing(conn, upload_dir) -> None:
 
         new_name = f"{src_disk.stem}-norm.mp4"
         new_disk = upload_dir / new_name
-        if not normalize_video(src_disk, new_disk):
+        # 3-state: 'skip' = already Tizen-optimal (leave the original untouched), 'written' = a -norm.mp4
+        # was produced (repoint + remove old), 'failed' = keep the original.
+        status = normalize_video(src_disk, new_disk)
+        if status == "skip":
+            skipped += 1
+            print(f"skip (already optimal)  media {r['id']:>4} ({r['file_path']})")
+            continue
+        if status != "written":
             failed += 1
             print(f"FAILED normalize        media {r['id']:>4} ({r['file_path']})")
             continue
 
-        # Regenerate the poster from the normalized file (new stem -> new poster name).
-        new_poster_name = f"{new_disk.stem}-poster.jpg"
+        # Regenerate the poster from the normalized file (new stem -> new poster name; lossless PNG).
+        new_poster_name = f"{new_disk.stem}-poster.png"
         new_poster_disk = upload_dir / new_poster_name
         new_poster_url = (
             f"/uploads/{new_poster_name}" if extract_last_frame(new_disk, new_poster_disk) else None
@@ -132,29 +139,24 @@ def _normalize_existing(conn, upload_dir) -> None:
     )
 
 
-def _backfill_playlist_videos(conn) -> None:
-    """Build the single concatenated loop video for every display's LIVE playlist (idempotent).
-
-    This is what removes the Tizen per-clip black gap on EXISTING displays without needing to
-    re-publish each one from the UI. Reuses the exact router logic (signature, skip-if-unchanged,
-    stale-file cleanup) so behaviour matches a normal publish."""
+def _backfill_playlist_videos(conn, upload_dir) -> None:
+    """Build the LOSSLESS joined clips (per-item video-run clips + the all-video MSE loop clip) for every
+    display's live playlist, idempotently — so EXISTING displays get them without re-publishing from the
+    UI. Reuses the exact router logic, so behaviour matches a normal publish (it also clears any legacy
+    whole-playlist concat and prunes stale clips)."""
     from .routers.ambient_router import _regenerate_playlist_video
 
     rows = conn.execute("SELECT id, name FROM ambient_displays ORDER BY id").fetchall()
-    built = 0
+    total = 0
     for r in rows:
-        before = conn.execute(
-            "SELECT playlist_video_path FROM ambient_displays WHERE id = ?", (r["id"],)
-        ).fetchone()["playlist_video_path"]
         _regenerate_playlist_video(conn, r["id"])
-        after = conn.execute(
-            "SELECT playlist_video_path FROM ambient_displays WHERE id = ?", (r["id"],)
-        ).fetchone()["playlist_video_path"]
-        status = "built/updated" if after and after != before else ("kept" if after else "none (<2 live items)")
-        print(f"playlist-video  display {r['id']:>4} ({r['name']}): {status} -> {after}")
-        if after and after != before:
-            built += 1
-    print(f"Playlist videos: built/updated={built} total displays={len(rows)}")
+        clips = (
+            sorted(p.name for p in upload_dir.glob(f"ambient-{r['id']}-run-*.mp4"))
+            + sorted(p.name for p in upload_dir.glob(f"ambient-{r['id']}-mseloop-*.mp4"))
+        )
+        total += len(clips)
+        print(f"joined-clips  display {r['id']:>4} ({r['name']}): {len(clips)} -> {clips or '—'}")
+    print(f"Joined clips: total={total} across {len(rows)} displays")
 
 
 def main() -> None:
@@ -168,8 +170,8 @@ def main() -> None:
     parser.add_argument(
         "--playlist-videos",
         action="store_true",
-        help="Also build the single concatenated loop video for each display's live playlist "
-             "(the per-clip black-gap fix). Safe/idempotent. Default: off.",
+        help="Also build the lossless joined clips (adjacent video-run clips + the all-video MSE loop) "
+             "for each display's live playlist. Safe/idempotent. Default: off.",
     )
     args = parser.parse_args()
 
@@ -187,7 +189,7 @@ def main() -> None:
         _normalize_existing(conn, upload_dir)
     _backfill_posters(conn, upload_dir)
     if args.playlist_videos:
-        _backfill_playlist_videos(conn)
+        _backfill_playlist_videos(conn, upload_dir)
 
     conn.close()
     print("Done.")

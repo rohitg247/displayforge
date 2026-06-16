@@ -935,3 +935,173 @@ than 7 days** (`_DEBUG_LOG_RETENTION_DAYS`), so file count is bounded (no per-sn
 tail-capped to ~2 MB); `?date=YYYY-MM-DD` views any retained day, and the response lists available days.
 Capture happens ONLY when `?debug=true` (the viewer only buffers/sends in that mode). The on-panel
 HUD still shows the live last-60 ring; the full history lives server-side.
+
+---
+
+## 2026-06-15 — Debug log readable at the viewer URL (Phase 1, commit e33fcb8)
+
+**Files:** `src/App.jsx`, `src/pages/AmbientDebugLogPage.jsx` (new), `src/services/api.js`,
+`src/pages/AmbientViewerPage.jsx`, `docs/deployment-steps.md`.
+
+### Why
+The v3.0 transcript was only reachable at `<VITE_API_URL>/api/ambient/<id>/debug-log/latest` (i.e.
+`:8888`), a different host/port from the viewer (`:3200`). The user wanted to read it at the **same
+origin + URL pattern as the viewer** — `http://<host>:3200/<branchId>/2/<id>/debug-log/latest` — so the
+`<branchId>/2/<id>` form is consistent everywhere.
+
+### Changes
+- **`src/App.jsx`** — new route `"/:branchId/2/:id/debug-log/latest"` → `AmbientDebugLogPage`, placed
+  before `*`. React Router v6 ranks the 5-segment path above the 3-segment viewer route, so
+  `/2/2/4` still resolves to the viewer and `/2/2/4/debug-log/latest` to the log page — no clash.
+- **`src/pages/AmbientDebugLogPage.jsx` (new)** — `useParams()` `id` + `useSearchParams()` `date` →
+  `api.getAmbientDebugLog(id, date)`; renders the plain-text transcript in a dark `<pre>`, auto-refetch
+  every 10 s, errors shown inline.
+- **`src/services/api.js`** — `getAmbientDebugLog(id, date)` fetches the plain-text endpoint via the
+  existing `API_BASE` (env-driven `VITE_API_URL`, never a hardcoded port), so the browser-facing URL is
+  `:3200` while the fetch transparently hits the backend.
+- **`src/pages/AmbientViewerPage.jsx`** — the snapshot `url` field now points at the debug-log page
+  (`${origin}${pathname}/debug-log/latest`) instead of the raw viewer href.
+- **`docs/deployment-steps.md`** — read-log example updated to the `:3200/<branchId>/2/<id>/debug-log/latest`
+  pattern.
+
+(Phase 1 also added an rAF-driven pre-end-seek watchdog and bumped `SINGLE_SEEK_LEAD` 0.15→0.25; that
+mechanism is **superseded** by the v3.1 setInterval watchdog below — see the next entry.)
+
+---
+
+## 2026-06-15 — Engine v3.1-loop-hardened: black-free endless seamless loop + source-tagged debug log
+
+**Files:** `src/pages/AmbientViewerPage.jsx`, `server/routers/ambient_router.py`.
+
+### Why (root cause, from on-panel logs)
+After v3.0 shipped to the panel the concatenated playlist video still **froze on its last frame after
+the first cycle — the loop never restarted** ("the video did not auto-play again"). The live
+`debug-log/latest` transcript proved the restart was **nondeterministic**: in some sessions the native
+`loop` wrapped (`=== loop wrap (ct 93.9→0.00) ===` with no seek), in one the `rAF pre-end seek → 0`
+fired once and then the log went silent (the freeze). So the v3.0/Phase-1 seek-to-0 was firing but not
+reliably taking.
+
+Pinned causes (seamless-loop path only):
+1. **Lead too small (0.25 s)** — the seek fired right at the end-of-stream boundary, where Tizen's HW
+   decoder unreliably honors a seek; it intermittently no-ops and the stream runs to true EOF.
+2. **`play()` only when `v.paused`** — a frozen-but-"playing" element (Tizen reports `paused=false`)
+   never got the resume nudge.
+3. **`loop` attribute still set** — it races with our seek AND (per HTML spec) **suppresses `ended`**,
+   disabling the last-resort recovery; the stuck-detector also required `v.paused` (never true on a
+   Tizen freeze), so recovery never triggered and `wrappingRef` wedged.
+4. **rAF can be throttled** while the HW video plane is composited — exactly when the watchdog must poll.
+
+### The no-black principle this fix is built around
+On the single HW decode plane, black appears only when (a) the stream reaches **true EOF** (plane
+blanks) or (b) we call **`load()`/swap `src`** (decoder torn down). A **backward seek to 0 on the
+still-playing element BEFORE EOF does NOT blank** — it jumps to the IDR at frame 0 and keeps presenting.
+So a black-free endless loop = reliably land that early seek every cycle, never reach EOF, never
+`load()`.
+
+### Changes — `src/pages/AmbientViewerPage.jsx` (seamless-loop path only; per-item engine untouched)
+1. **Removed the `loop` attribute** from the seamless `<video>` — stops the race and restores a usable
+   `ended` event.
+2. **rAF watchdog → ~100 ms `setInterval`** (`SINGLE_TICK_MS`); `setInterval` isn't throttled by the HW
+   compositor. Replaced `singleRafRef`/`singleActiveRef` with `singleTickRef`.
+3. **`SINGLE_SEEK_LEAD` 0.25 → 1.5 s** — seeks well clear of the fragile EOS boundary; the ~1.5 s trimmed
+   tail is invisible on an endless loop (slightly shorter each cycle, never black).
+4. **Seek retried EVERY tick until the wrap is confirmed.** On entering the pre-end window: set
+   `wrappingRef`, `currentTime = 0`, `play()`. On each later tick while ct is still high: re-issue the
+   seek (≈15 attempts before EOF could be reached). When ct drops below ~1 s: `loop: wrap CONFIRMED`,
+   release the guard. **`play()` is called after every seek** (not only when paused).
+5. **Auto-resume on Tizen's seek/buffer pause** — new `onPause`/`onSeeked` handlers immediately `play()`
+   a paused (non-ended) element. This is the direct fix for "didn't auto-play after the first cycle."
+6. **Stuck-detector fixed** — triggers on `v.ended || (ct >= dur-0.05)`, dropped the `&& v.paused`
+   requirement (false on a Tizen freeze).
+7. **`load()` is now strictly a last-resort freeze-breaker** (`singleLoadBreaker`), reached only after a
+   wrap has been stuck at EOF for >1.5 s with retries exhausted — the ONLY path that can briefly flash
+   black, logged loudly (`loop: seek FAILED → load()`), and expected to never run in normal operation.
+   `handleSingleEnded` routes through the same breaker.
+8. **Detailed logging (user request).** A ~2 s **heartbeat** (`hb ct=… dur=… paused=… ended=… rs=… ns=…`)
+   plus wired media events on the seamless `<video>`:
+   `onSeeking/onSeeked/onPause/onPlaying/onWaiting/onStalled/onLoadedMetadata/onLoadedData`. Greppable
+   restart-path labels: `loop: seek→0 requested` / `wrap CONFIRMED` / `seek retry` / `seek FAILED → load()`.
+9. **`ENGINE_VERSION` → `3.1-loop-hardened`** (HUD top line + init log) so a redeploy is verifiable.
+
+### Source-tagged debug log (TV vs laptop)
+Both the Samsung panel and a laptop browser can open `?debug=true` and stream to the **same day-file**.
+Each batch is now tagged with its source so the transcript is unambiguous:
+- **Frontend** — `CLIENT_KIND` is computed once from the user-agent (`Tizen`/`SMART-TV`/webOS → `TV`,
+  else `laptop`) and sent in the POST payload (`client`, plus full `ua`).
+- **Backend (`server/routers/ambient_router.py`)** — the `latest.json` status snapshot gains
+  `client` + `user_agent`, and every appended event line is prefixed with a fixed-width source tag,
+  e.g. `2026-06-15T…Z  [TV    ] #2  [success  ] loop: wrap CONFIRMED (ct=0.10)`.
+
+### Deploy
+This round touches the **backend** (source tag) as well as the frontend, so rebuild both:
+```bash
+git pull && docker compose up -d --build backend frontend
+```
+No DB migration and no `backfill_posters` needed.
+
+### Verify
+`npm run build` green; `ast.parse` of `ambient_router.py` OK. On the panel `?debug=true`, run ≥3 full
+loops: HUD shows `v3.1-loop-hardened`; every loop logs `loop: seek→0 requested …` → `loop: wrap
+CONFIRMED …` with a steady `hb …` heartbeat; `ERRORS: 0`; **never** `loop: seek FAILED → load()` (that
+would mean a black flash); visually continuous — no freeze on the last frame, no black at the seam.
+
+### Not changed
+The per-item fallback engine (bridge/poster transitions), the backend concat builder, and the
+`timeupdate` handler (kept as a secondary trigger) are untouched.
+
+---
+
+## 2026-06-16 — Engine v4: full-quality hybrid (per-item + lossless video-run concat + MSE all-video loop)
+
+**Files:** `server/media_utils.py`, `server/routers/ambient_router.py`, `server/backfill_posters.py`,
+`src/pages/AmbientViewerPage.jsx`; docs: `docs/ambient-playback-findings-and-fallback.md` (new),
+`docs/deployment-steps.md`, `plan.md`.
+
+### Why
+The v3.0/v3.1 **single whole-playlist concat** caused every reported symptom on display 2: decode-stall
+**seams** (stuck/skip on both TV and laptop, at the stream-copy↔re-encode join points — `ffmpeg -f
+concat -c copy` doesn't re-stamp timestamps, so mismatched timebase/GOP/SAR froze the decoder with
+`rs=2 ns=1`), **black at the loop** (seek-to-0 unreliable → `load()` teardown), and **degraded quality**
+(images baked into 1080p 4:2:0; videos re-encoded on top of the CRF-20 normalize). The architecture is
+the quality ceiling, so it was retired. Full investigation + sources + fallback runbook:
+`docs/ambient-playback-findings-and-fallback.md`.
+
+### What changed
+- **No whole-playlist concat.** `get_ambient_display` never serves a built concat; `_regenerate_playlist_video`
+  clears the legacy pointer and deletes the file. The viewer runs the **per-item engine** (full-res
+  `<img>` images, individual videos) for any playlist containing an image.
+- **`normalize_video` is now 3-state** (`skip`/`written`/`failed`): an already-Tizen-friendly **and**
+  faststart upload is served **byte-for-byte** (no ffmpeg); compatible-but-not-faststart gets a
+  **lossless `-c copy` remux**; only genuinely incompatible sources are re-encoded, now at **CRF 18**
+  (was 20), downscaling only above the 1080p ceiling. The upload endpoint deletes the raw file **only**
+  on `written` (the `skip` path keeps the original).
+- **Posters are lossless** (`extract_last_frame` → PNG at native resolution) — no "soft poster" jump.
+- **Lossless video-run concat**: ≥2 **adjacent** videos are joined by stream copy (`build_video_run`)
+  only when they pass a strict gate (codec/profile/level, w×h, fps, **time_base**, **SAR**, **start_pts==0
+  / no edit list**); a lossless container-timing **widener** recovers runs that differ only in timing;
+  otherwise they stay per-item.
+- **Loop wrap when first AND last are videos** (with ≥1 image): cyclic **wrap-run + rotation**
+  (`_playback_groups`) puts the `Vlast→V0` transition INSIDE one lossless clip and makes the loop's file
+  boundary a safe video→image edge. No poster-timing, no seek, no reload.
+- **All-video playlists**: `playback_mode: 'mse-loop'` — one fragmented, video-only lossless clip
+  (`build_mse_loop` + `.codecs` sidecar) looped via **Media Source Extensions** in the viewer
+  (Tizen 7.0 / Chromium 94), appended on a ring so it never ends/reloads/seeks. Falls back to native
+  `loop`, then AVPlay (Approach 2).
+- `backfill_posters.py`: handles the 3-state normalize, PNG posters, and `--playlist-videos` now builds
+  the lossless joined clips (run + MSE) for existing displays.
+
+### Result
+Full image+video quality (originals/lossless), no decode-stall seams, no skipped images, and a black-free
+loop restart for every first/last combination. Debug logging is unchanged and still readable at the
+viewer-origin `/debug-log/latest` URL (now reports `mode: per-item-engine` / `mse-loop`).
+
+### Verify
+`py_compile` (3 backend modules) OK; `npm run lint` clean; `npm run build` green. On the panel with
+`?debug=true`: `MODE: per-item engine` (or `mse-loop ✓` for all-video), `ERRORS: 0`, no stall at the old
+seam timestamps, every transition + the loop shows freeze-or-clean (no TRUE black), images/videos sharp.
+Any TRUE black at a video edge → escalate to the AVPlay `.wgt` (Approach 2 in the findings doc).
+
+### Deploy / one-time cleanup
+`docker compose up -d --build backend` → `docker compose exec backend python -m server.backfill_posters
+--playlist-videos` (builds the joined clips, clears the legacy pointers, deletes the broken
+`ambient-*-playlist-*.mp4`) → rebuild frontend. New publishes rebuild automatically.

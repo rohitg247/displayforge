@@ -94,6 +94,15 @@ export function AmbientViewerPage() {
   const playlistVideoUrl = (!isPreview && display && display.playlist_video) ? display.playlist_video : null;
   const singleVideoMode = !!playlistVideoUrl;
 
+  // MSE gapless-loop mode: an ALL-VIDEO live playlist (no image to absorb the loop restart). The backend
+  // built ONE fragmented, video-only clip; the viewer loops it via Media Source Extensions on a single
+  // <video> — segments appended on a ring so it NEVER ends/reloads/seeks (the only black-free way to
+  // loop pure video in the Tizen 7.0 / Chromium browser). Live viewing only; falls back to native loop
+  // if MSE is unavailable, and the per-item engine handles every playlist that contains an image.
+  const mseMode = !!(!isPreview && display && display.playback_mode === 'mse-loop' && display.loop_video);
+  const mseLoopUrl = mseMode ? display.loop_video : null;
+  const mseCodec = mseMode ? (display.loop_codec || '') : '';
+
   // KEEP refs (from previous implementation, semantics unchanged)
   const mediaRef = useRef([]);
   const currentIdxRef = useRef(0);
@@ -110,6 +119,7 @@ export function AmbientViewerPage() {
   const bridgeCtxRef = useRef(null);
   const lastBridgeLumaRef = useRef(-1);  // mean luma of the last canvas capture; <=2 means drawImage is black on this panel
   const singleVideoRef = useRef(null);   // seamless-loop mode: the single <video> playing the concatenated playlist
+  const mseVideoRef = useRef(null);      // mse-loop mode: the single <video> fed by Media Source Extensions
   const lastSingleCtRef = useRef(0);     // tracks currentTime to detect/log the loop wrap
   const singleTickRef = useRef(null);    // setInterval handle for the seamless-loop restart watchdog
   const wrappingRef = useRef(false);     // true from the pre-end seek until the wrap is confirmed (ct dropped)
@@ -935,7 +945,7 @@ export function AmbientViewerPage() {
   /* ----------------------------- AUTOSTART EFFECT --------------------------- */
 
   useEffect(() => {
-    if (singleVideoMode) return;  // seamless-loop mode handles playback; the per-item engine stays idle
+    if (singleVideoMode || mseMode) return;  // a single-<video> engine handles playback; per-item stays idle
     if (stateRef.current !== STATE_IDLE) return;
     if (!display || media.length === 0) return;
     if (!videoRef.current || !imageARef.current || !imageBRef.current || !bridgeCanvasRef.current) return;
@@ -945,7 +955,7 @@ export function AmbientViewerPage() {
     logEvent('lifecycle', 'mount [img-B]');
     logEvent('lifecycle', 'mount [bridge]');
     start(media[0]);
-  }, [display, media, start, logEvent, singleVideoMode]);
+  }, [display, media, start, logEvent, singleVideoMode, mseMode]);
 
   /* --------------------- SEAMLESS-LOOP MODE (single file) ------------------- */
 
@@ -1145,6 +1155,118 @@ export function AmbientViewerPage() {
     };
   }, [singleVideoMode, singleLoopTick]);
 
+  /* ----------------------- MSE GAPLESS-LOOP MODE (all-video) ---------------------- */
+  // Feed ONE <video> the fragmented loop clip via Media Source Extensions in `sequence` mode, appending
+  // it again whenever the buffer runs low — so the element never reaches `ended`, never reloads, never
+  // seeks (a backward seek/reload is the ONLY thing that blanks the Tizen plane). That makes the
+  // video→video loop wrap of an all-video playlist black-free. If MSE is unavailable or errors, fall
+  // back to the native `loop` attribute (best-effort) so playback never dies. Verify on-panel; if the
+  // native fallback flashes, the AVPlay .wgt (Approach 2) is the guaranteed escalation.
+  useEffect(() => {
+    if (!mseMode) return;
+    const v = mseVideoRef.current;
+    if (!v) return;
+
+    let cancelled = false;
+    let mediaSource = null;
+    let objectUrl = null;
+    let sb = null;
+    let segment = null;          // the whole fragmented clip (re-appended each loop)
+    let appendedOnce = false;
+    lastHeartbeatAtRef.current = 0;
+
+    const QUEUE_AHEAD = 20;      // keep ~20s buffered ahead of playback
+    const KEEP_BEHIND = 10;      // evict buffered data older than ~10s behind currentTime
+
+    const nativeFallback = (why) => {
+      if (cancelled) return;
+      if (isDebug) logEvent('warn', `mse: native-loop fallback (${why})`);
+      try {
+        v.loop = true;
+        v.src = mseLoopUrl;
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+      } catch (_) { /* ignore */ }
+    };
+
+    const supported = typeof window !== 'undefined' && 'MediaSource' in window
+      && !!mseCodec && window.MediaSource.isTypeSupported(mseCodec);
+    if (!supported) { nativeFallback(mseCodec ? `codec unsupported (${mseCodec})` : 'no MSE'); return; }
+
+    const tryAppendMore = () => {
+      if (cancelled || !sb || sb.updating || !segment) return;
+      try {
+        const b = sb.buffered;
+        const ahead = b.length ? b.end(b.length - 1) - v.currentTime : 0;
+        if (!appendedOnce || ahead < QUEUE_AHEAD) {
+          appendedOnce = true;
+          sb.appendBuffer(segment);  // sequence mode → continues the timeline (gapless repeat)
+        }
+      } catch (e) {
+        if (e && e.name === 'QuotaExceededError') {
+          try {
+            const cur = v.currentTime;
+            if (sb.buffered.length && sb.buffered.start(0) < cur - KEEP_BEHIND) {
+              sb.remove(sb.buffered.start(0), cur - KEEP_BEHIND);
+            }
+          } catch (_) { /* retry next tick */ }
+        } else {
+          nativeFallback(`append ${e?.name ?? 'Error'}`);
+        }
+      }
+    };
+
+    const onSourceOpen = () => {
+      if (cancelled) return;
+      try {
+        sb = mediaSource.addSourceBuffer(mseCodec);
+        sb.mode = 'sequence';
+        sb.addEventListener('updateend', tryAppendMore);
+        tryAppendMore();
+      } catch (e) {
+        nativeFallback(`addSourceBuffer ${e?.name ?? 'Error'}`);
+      }
+    };
+
+    fetch(mseLoopUrl, { cache: 'force-cache' })
+      .then((r) => r.arrayBuffer())
+      .then((buf) => {
+        if (cancelled) return;
+        segment = new Uint8Array(buf);
+        mediaSource = new window.MediaSource();
+        objectUrl = URL.createObjectURL(mediaSource);
+        mediaSource.addEventListener('sourceopen', onSourceOpen);
+        v.src = objectUrl;
+        const p = v.play(); if (p && p.catch) p.catch(() => {});
+        if (isDebug) logEvent('state', `MODE mse-loop · ${basename(mseLoopUrl)} [${mseCodec}]`);
+      })
+      .catch((e) => nativeFallback(`fetch ${e?.message ?? e}`));
+
+    // Top up the buffer + keep playing + heartbeat (the panel can't be watched live).
+    const tick = setInterval(() => {
+      if (cancelled) return;
+      tryAppendMore();
+      if (v.paused && !v.ended) { const p = v.play(); if (p && p.catch) p.catch(() => {}); }
+      const now = performance.now();
+      if (isDebug && now - lastHeartbeatAtRef.current >= SINGLE_HEARTBEAT_MS) {
+        lastHeartbeatAtRef.current = now;
+        let ahead = 0;
+        try { const b = sb && sb.buffered; if (b && b.length) ahead = b.end(b.length - 1) - v.currentTime; } catch (_) { /* ignore */ }
+        logEvent('verbose',
+          `hb(mse) ct=${isFinite(v.currentTime) ? v.currentTime.toFixed(2) : '?'} ahead=${ahead.toFixed(1)} ` +
+          `paused=${v.paused} ended=${v.ended} rs=${v.readyState} mss=${mediaSource ? mediaSource.readyState : '?'}`);
+      }
+    }, 1000);
+
+    return () => {
+      cancelled = true;
+      clearInterval(tick);
+      try { if (sb) sb.removeEventListener('updateend', tryAppendMore); } catch (_) { /* ignore */ }
+      try { if (mediaSource && mediaSource.readyState === 'open') mediaSource.endOfStream(); } catch (_) { /* ignore */ }
+      try { if (objectUrl) URL.revokeObjectURL(objectUrl); } catch (_) { /* ignore */ }
+      try { v.removeAttribute('src'); v.load(); } catch (_) { /* ignore */ }
+    };
+  }, [mseMode, mseLoopUrl, mseCodec, isDebug, logEvent]);
+
   // Stream the on-panel ?debug log to the backend (readable at /api/ambient/<id>/debug-log/latest —
   // no need to photograph the TV). Sends EVERY buffered event in chronological batches; on a confirmed
   // POST the sent events are dropped, otherwise they're kept and retried next tick (survives blips).
@@ -1155,11 +1277,13 @@ export function AmbientViewerPage() {
       if (debugSendingRef.current) return;
       const batch = pendingLogRef.current.slice(0, DEBUG_BATCH_MAX);  // chronological (pushed in order)
       const lastSeq = batch.length ? batch[batch.length - 1].seq : 0;
-      const vv = singleVideoMode ? singleVideoRef.current : videoRef.current;
+      const vv = mseMode ? mseVideoRef.current : singleVideoMode ? singleVideoRef.current : videoRef.current;
       const header = {
-        mode: singleVideoMode ? 'seamless-loop' : 'per-item-engine',
+        mode: mseMode ? 'mse-loop' : singleVideoMode ? 'seamless-loop' : 'per-item-engine',
         state: stateRef.current,
-        item: singleVideoMode ? basename(playlistVideoUrl) : basename(mediaRef.current[currentIdxRef.current]?.file_path),
+        item: mseMode ? basename(mseLoopUrl)
+          : singleVideoMode ? basename(playlistVideoUrl)
+          : basename(mediaRef.current[currentIdxRef.current]?.file_path),
         rs: vv?.readyState, ns: vv?.networkState,
         ct: vv && isFinite(vv.currentTime) ? +vv.currentTime.toFixed(2) : null,
         dur: vv && isFinite(vv.duration) ? +vv.duration.toFixed(2) : null,
@@ -1192,7 +1316,7 @@ export function AmbientViewerPage() {
     send();
     const handle = setInterval(send, DEBUG_POST_INTERVAL_MS);
     return () => { clearInterval(handle); send(); };  // best-effort final flush
-  }, [isDebug, id, singleVideoMode, playlistVideoUrl]);
+  }, [isDebug, id, singleVideoMode, playlistVideoUrl, mseMode, mseLoopUrl]);
 
   /* -------------------------------- CLEANUP --------------------------------- */
 
@@ -1328,10 +1452,12 @@ export function AmbientViewerPage() {
     : stateRef.current === STATE_PLAYING ? '#7f7'
     : '#888';
   const currentItem = mediaRef.current[currentIdxRef.current];
-  const currentName = singleVideoMode
-    ? basename(playlistVideoUrl)
-    : (currentItem ? basename(currentItem.file_path) : '—');
-  const v = singleVideoMode ? singleVideoRef.current : videoRef.current;
+  const currentName = mseMode
+    ? basename(mseLoopUrl)
+    : singleVideoMode
+      ? basename(playlistVideoUrl)
+      : (currentItem ? basename(currentItem.file_path) : '—');
+  const v = mseMode ? mseVideoRef.current : singleVideoMode ? singleVideoRef.current : videoRef.current;
   const rs = v?.readyState ?? '?';
   const ns = v?.networkState ?? '?';
   const ct = v ? v.currentTime.toFixed(2) : '0.00';
@@ -1353,7 +1479,27 @@ export function AmbientViewerPage() {
       }}
     >
       <div style={containerStyle}>
-        {singleVideoMode ? (
+        {mseMode ? (
+          /* MSE gapless-loop mode (all-video playlist): ONE <video> fed by Media Source Extensions on a
+             ring (see the mse-loop effect). No src swap, no seek, no `ended` → black-free video→video
+             loop. `loop` is left OFF here; the effect re-appends the buffer (or sets native loop on
+             fallback). */
+          <video
+            ref={mseVideoRef}
+            muted
+            playsInline
+            autoPlay
+            style={{
+              position: 'absolute',
+              inset: 0,
+              width: '100%',
+              height: '100%',
+              objectFit: 'cover',
+              zIndex: 1,
+              background: '#000',
+            }}
+          />
+        ) : singleVideoMode ? (
           /* Seamless-loop mode: ONE <video> plays the whole concatenated playlist. No src swaps →
              no Tizen black gap between items; a ~100ms setInterval watchdog seeks to 0 ~1.5s before
              EOF (on the still-playing element, so no decoder teardown) for a black-free loop restart.
@@ -1457,13 +1603,13 @@ export function AmbientViewerPage() {
             }}
           >
             <div style={{ color: '#0ff', fontWeight: 700 }}>v{ENGINE_VERSION} · {BUILD_STAMP}</div>
-            <div style={{ color: singleVideoMode ? '#7f7' : '#ff7', fontWeight: 700 }}>
-              MODE: {singleVideoMode ? 'seamless-loop ✓' : 'per-item engine (fallback)'}
+            <div style={{ color: (mseMode || singleVideoMode) ? '#7f7' : '#ff7', fontWeight: 700 }}>
+              MODE: {mseMode ? 'mse-loop ✓ (all-video)' : singleVideoMode ? 'seamless-loop ✓' : 'per-item engine'}
             </div>
             <div style={{ color: stateColor, fontWeight: 700 }}>STATE: {stateRef.current}</div>
             <div>ITEM:  {currentName} ({ct}s / {dur}s)</div>
             <div>rs={rs} ns={ns} ct={ct} paused={paused} muted={muted}</div>
-            {!singleVideoMode && (
+            {!singleVideoMode && !mseMode && (
               <div>BRIDGE: {bridgeOn ? 'on' : 'off'}    PREFETCH: {prefetchNameRef.current} ({prefetchStatusRef.current})</div>
             )}
             <div>

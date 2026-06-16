@@ -18,7 +18,7 @@ from ..models import (
     ActivePlaylistRequest,
     PublishPlaylistRequest,
 )
-from ..media_utils import extract_last_frame, normalize_video, build_playlist_video
+from ..media_utils import extract_last_frame, normalize_video, build_video_run, build_mse_loop
 
 router = APIRouter()
 
@@ -80,97 +80,186 @@ def _unlink_upload(upload_dir: Path, url_or_path) -> None:
             pass
 
 
-def _regenerate_playlist_video(db: sqlite3.Connection, display_id: int) -> None:
-    """Rebuild the single concatenated loop video for a display's LIVE playlist (best-effort).
+def _unlink_quiet(path: Path) -> None:
+    """Best-effort delete of an absolute path (ignore if missing / locked)."""
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
 
-    Playing one continuous file is what actually removes the Tizen per-clip black gap (no <video>.src
-    swaps → no decoder teardown). This is called after any change to live content. It is idempotent
-    via a signature of the live items: if the live set is unchanged the existing file is kept. On any
-    failure it clears the pointer so the viewer cleanly falls back to its per-item engine.
+
+# ----------------------------------------------------------------------------------------------
+# Hybrid playback: the viewer ALWAYS runs the per-item engine (full-quality images as <img>, videos
+# played individually). The only server-side "joining" is a LOSSLESS concat of a RUN of ≥2 ADJACENT
+# videos into one clip (built by media_utils.build_video_run) so that back-to-back videos play as a
+# single never-reloaded <video> on Tizen (motion-seamless). Images are never baked into a video.
+# Run clips are named ambient-<id>-run-<sig>.mp4 (+ -poster.png); their existence on disk is the source
+# of truth — get_ambient_display collapses a run into one media item only when the file is present.
+# ----------------------------------------------------------------------------------------------
+
+def _is_built_run(url_or_path) -> bool:
+    """True for a run clip WE built (ambient-<id>-run-<sig>.mp4 / -poster.png)."""
+    return bool(url_or_path) and "-run-" in Path(url_or_path).name
+
+
+def _group_runs(rows):
+    """Split ordered media rows into groups: each group is either a maximal run of consecutive videos
+    (same playlist) or a single non-video row. A group of ≥2 videos is a run-concat candidate."""
+    groups, cur = [], []
+    for r in rows:
+        if (r["media_type"] == "video" and cur
+                and cur[-1]["media_type"] == "video" and cur[-1]["playlist"] == r["playlist"]):
+            cur.append(r)
+        else:
+            if cur:
+                groups.append(cur)
+            cur = [r]
+    if cur:
+        groups.append(cur)
+    return groups
+
+
+def _is_video_group(g) -> bool:
+    return bool(g) and all(r["media_type"] == "video" for r in g)
+
+
+def _playback_groups(rows):
+    """Ordered playback groups, with the loop wrap made black-free for the video→video case.
+
+    When the playlist is video-bounded (first AND last items are videos) AND has at least one non-video
+    item, the trailing + leading video runs are *adjacent across the loop wrap*. We merge them into ONE
+    wrap-run and ROTATE so it sits contiguously at the END. The viewer then plays
+    `[...middle..., wrapRun]`, so the Vlast→V0 transition happens INSIDE one lossless clip (gapless, no
+    src swap / seek / poster) and the loop's file boundary becomes a safe video→image edge (the rotated
+    list starts on the first non-video item). Deterministic, so the build and the view agree.
+
+    (All-video playlists collapse to a single video group here; the caller routes those to the MSE
+    gapless-loop path instead, since there is no image to absorb the file restart.)"""
+    groups = _group_runs(rows)
+    if (len(groups) >= 2 and _is_video_group(groups[0]) and _is_video_group(groups[-1])
+            and any(not _is_video_group(g) for g in groups)):
+        wrap = list(groups[-1]) + list(groups[0])   # [Vlast run...] + [V0 run...]
+        return groups[1:-1] + [wrap]                # rotate: start after the leading run, end with wrap
+    return groups
+
+
+def _run_sig(run_rows) -> str:
+    """Stable signature of a run (its ordered source filenames) → content-addressed run-clip name."""
+    src = "|".join(Path(r["file_path"]).name for r in run_rows)
+    return hashlib.sha1(src.encode("utf-8")).hexdigest()[:12]
+
+
+def _collapse_runs_for_view(rows, display_id: int, upload_dir: Path):
+    """Return the playback media list with each BUILT video run collapsed into one synthetic video item
+    (file_path = run clip, poster_path = run's last-frame poster). A run whose clip isn't on disk yet is
+    left as individual videos (safe per-item fallback). Never raises into the request."""
+    out = []
+    for g in _playback_groups(rows):
+        if len(g) >= 2 and _is_video_group(g):
+            sig = _run_sig(g)
+            run_name = f"ambient-{display_id}-run-{sig}.mp4"
+            run_disk = upload_dir / run_name
+            if run_disk.exists() and run_disk.stat().st_size > 0:
+                first = g[0]
+                poster_name = f"ambient-{display_id}-run-{sig}-poster.png"
+                poster_url = f"/uploads/{poster_name}" if (upload_dir / poster_name).exists() else None
+                out.append({
+                    "id": first["id"],
+                    "ambient_display_id": display_id,
+                    "file_path": f"/uploads/{run_name}",
+                    "media_type": "video",
+                    "playlist": first["playlist"],
+                    "sort_order": first["sort_order"],
+                    "status": first["status"],
+                    "poster_path": poster_url,
+                    "duration": None,
+                })
+                continue
+        out.extend(dict(r) for r in g)
+    return out
+
+
+def _regenerate_playlist_video(db: sqlite3.Connection, display_id: int) -> None:
+    """Rebuild the LOSSLESS video-run clips for a display's LIVE playlist (best-effort, idempotent).
+
+    The viewer always runs the per-item engine, so there is NO whole-playlist concat any more — that
+    file baked images (quality loss) and produced decode-stall seams. Instead, for each maximal run of
+    ≥2 ADJACENT compatible videos we build ONE stream-copy clip (`media_utils.build_video_run`) so a
+    back-to-back video run plays as a single never-reloaded <video> (motion-seamless, zero quality
+    loss). Images and lone videos are left untouched. Called after any change to live content
+    (publish / reorder / delete). On every call it also clears any LEGACY whole-playlist concat pointer
+    and prunes run clips that are no longer referenced.
     """
     disp = db.execute(
-        "SELECT active_playlist, orientation, playlist_video_path, playlist_video_sig FROM ambient_displays WHERE id = ?",
+        "SELECT active_playlist, playlist_video_path FROM ambient_displays WHERE id = ?",
         (display_id,),
     ).fetchone()
     if not disp:
         return
 
+    upload_dir = Path(settings.UPLOAD_DIR)
+
+    # 1. Retire the legacy whole-playlist concat entirely (the viewer never uses it now).
+    old_path = disp["playlist_video_path"]
+    if old_path is not None:
+        db.execute(
+            "UPDATE ambient_displays SET playlist_video_path = NULL, playlist_video_sig = NULL WHERE id = ?",
+            (display_id,),
+        )
+        db.commit()
+    if _is_built_concat(old_path):
+        _unlink_upload(upload_dir, old_path)
+
+    # 2. Build the lossless joined clips the live set needs.
     playlist = disp["active_playlist"] or "A"
     rows = db.execute(
-        """SELECT file_path, media_type, sort_order, duration FROM ambient_media
+        """SELECT file_path, media_type, playlist, sort_order FROM ambient_media
            WHERE ambient_display_id = ? AND playlist = ? AND status = 'live'
            ORDER BY sort_order, id""",
         (display_id, playlist),
     ).fetchall()
 
-    upload_dir = Path(settings.UPLOAD_DIR)
-    items = [{"file_path": r["file_path"], "media_type": r["media_type"], "duration": r["duration"]} for r in rows]
+    wanted_runs = set()   # per-item run clips (ambient-<id>-run-<sig>.mp4)
+    wanted_loops = set()  # all-video MSE loop clips (ambient-<id>-mseloop-<sig>.mp4)
 
-    # Signature of the live set (filenames + order + per-image duration + orientation + audio mode).
-    # Unchanged sig ⇒ nothing to do. Use a STABLE hash (not Python's per-process salted hash()) so the
-    # filename/skip check is consistent across restarts.
-    sig_src = (
-        "|".join(f"{it['media_type']}:{it['file_path']}:{it['duration'] or ''}" for it in items)
-        + f"@{disp['orientation']}|audio={settings.AMBIENT_PLAYLIST_AUDIO}|img={settings.AMBIENT_IMAGE_SECONDS}"
-    )
-    sig = hashlib.sha1(sig_src.encode("utf-8")).hexdigest()[:12]
-
-    old_path = disp["playlist_video_path"]
-
-    # Single-item playlist needs no concat:
-    #   one VIDEO -> point straight at that clip's URL; the viewer's seamless seek-to-0 loop runs on
-    #                it directly (one <video> looping one file — lossless, no build).
-    #   one IMAGE / empty -> NULL (a still never loop-blacks; the per-item engine renders it).
-    if len(items) < 2:
-        single_url = items[0]["file_path"] if (items and items[0]["media_type"] == "video") else None
-        single_sig = ("single:" + single_url) if single_url else None
-        if old_path != single_url or disp["playlist_video_sig"] != single_sig:
-            db.execute(
-                "UPDATE ambient_displays SET playlist_video_path = ?, playlist_video_sig = ? WHERE id = ?",
-                (single_url, single_sig, display_id),
-            )
-            db.commit()
-            if _is_built_concat(old_path) and Path(old_path).name != Path(single_url or "x").name:
-                _unlink_upload(upload_dir, old_path)
-        return
-
-    if disp["playlist_video_sig"] == sig and disp["playlist_video_path"]:
-        existing = upload_dir / Path(disp["playlist_video_path"]).name
-        if existing.exists() and existing.stat().st_size > 0:
-            return  # live set unchanged and file present — keep it
-
-    out_name = f"ambient-{display_id}-playlist-{sig}.mp4"
-    out_path = upload_dir / out_name
-    abs_items = [
-        {"file_path": str(upload_dir / Path(it["file_path"]).name),
-         "media_type": it["media_type"], "duration": it["duration"]}
-        for it in items
-    ]
-    ok = out_path.exists() and out_path.stat().st_size > 0
-    if not ok:
-        ok = build_playlist_video(
-            abs_items, out_path, disp["orientation"],
-            image_seconds=settings.AMBIENT_IMAGE_SECONDS,
-            include_audio=settings.AMBIENT_PLAYLIST_AUDIO,
-        )
-
-    if ok:
-        db.execute(
-            "UPDATE ambient_displays SET playlist_video_path = ?, playlist_video_sig = ? WHERE id = ?",
-            (f"/uploads/{out_name}", sig, display_id),
-        )
-        db.commit()
-        # Remove a now-superseded BUILT concat (never a real media clip pointed at directly).
-        if _is_built_concat(old_path) and Path(old_path).name != out_name:
-            _unlink_upload(upload_dir, old_path)
+    if rows and _is_video_group(rows):
+        # ALL videos, no image to absorb the loop restart → one fragmented clip looped gaplessly via MSE.
+        sig = _run_sig(rows)
+        loop_name = f"ambient-{display_id}-mseloop-{sig}.mp4"
+        wanted_loops.add(loop_name)
+        loop_path = upload_dir / loop_name
+        if not (loop_path.exists() and loop_path.stat().st_size > 0):
+            srcs = [upload_dir / Path(r["file_path"]).name for r in rows]
+            build_mse_loop(srcs, loop_path)  # best-effort; writes loop + .codecs sidecar
     else:
-        # Build failed — clear the pointer so the viewer falls back to the per-item engine.
-        if disp["playlist_video_path"]:
-            db.execute(
-                "UPDATE ambient_displays SET playlist_video_path = NULL, playlist_video_sig = NULL WHERE id = ?",
-                (display_id,),
-            )
-            db.commit()
+        # Mixed / has images → per-item engine. Pre-join each run of ≥2 adjacent videos (incl. the
+        # cyclic wrap-run when first AND last are videos, via _playback_groups) into one lossless clip.
+        for g in _playback_groups(rows):
+            if len(g) < 2 or not _is_video_group(g):
+                continue
+            sig = _run_sig(g)
+            run_name = f"ambient-{display_id}-run-{sig}.mp4"
+            wanted_runs.add(run_name)
+            run_path = upload_dir / run_name
+            if run_path.exists() and run_path.stat().st_size > 0:
+                continue  # already built (content-addressed) — keep it
+            srcs = [upload_dir / Path(r["file_path"]).name for r in g]
+            if build_video_run(srcs, run_path):
+                # Lossless last-frame poster (covers the run→next-item edge on Tizen).
+                extract_last_frame(run_path, upload_dir / f"ambient-{display_id}-run-{sig}-poster.png")
+            # If the build failed, the file is absent → get_ambient_display shows the videos per-item.
+
+    # 3. Prune joined clips this display no longer references (run clips + posters, and MSE loop clips
+    #    + their .codecs sidecars).
+    for p in upload_dir.glob(f"ambient-{display_id}-run-*.mp4"):
+        if p.name not in wanted_runs:
+            _unlink_quiet(p)
+            _unlink_quiet(p.with_name(p.stem + "-poster.png"))
+    for p in upload_dir.glob(f"ambient-{display_id}-mseloop-*.mp4"):
+        if p.name not in wanted_loops:
+            _unlink_quiet(p)
+            _unlink_quiet(p.with_name(p.name + ".codecs"))
 
 
 @router.get("", response_model=list[AmbientDisplayOut])
@@ -259,17 +348,39 @@ def get_ambient_display(
             (display_id,),
         ).fetchall()
 
-    # The pre-built single-loop video applies to the LIVE active playlist only (it's what removes the
-    # Tizen per-clip black gap). Don't offer it in admin/preview mode (draft content, specific
-    # playlist) — there the per-item engine renders the draft. `disp` is SELECT * so the column is
-    # present once the migration has run; guard with a default for older rows.
+    # The whole-playlist concat is retired (it baked images and produced decode-stall seams). The viewer
+    # runs the per-item engine for any playlist containing an image, and the MSE gapless-loop engine for
+    # an ALL-VIDEO playlist (no image to absorb the loop restart). `playlist_video` stays None so a stale
+    # built concat is never served. Defaults below keep image/mixed playlists on the per-item path.
     playlist_video = None
-    if not admin:
-        pv = disp["playlist_video_path"] if "playlist_video_path" in disp.keys() else None
-        if pv:
-            pv_disk = Path(settings.UPLOAD_DIR) / Path(pv).name
-            if pv_disk.exists() and pv_disk.stat().st_size > 0:
-                playlist_video = pv
+    playback_mode = "per-item"
+    loop_video = None
+    loop_codec = None
+    upload_dir = Path(settings.UPLOAD_DIR)
+
+    if admin:
+        media = [dict(m) for m in media_rows]
+    else:
+        try:
+            if media_rows and _is_video_group(media_rows):
+                # ALL-VIDEO live playlist → MSE gapless loop on one fragmented clip (built by
+                # _regenerate_playlist_video). Falls back to per-item if the loop clip isn't on disk yet.
+                sig = _run_sig(media_rows)
+                loop_name = f"ambient-{display_id}-mseloop-{sig}.mp4"
+                loop_disk = upload_dir / loop_name
+                if loop_disk.exists() and loop_disk.stat().st_size > 0:
+                    playback_mode = "mse-loop"
+                    loop_video = f"/uploads/{loop_name}"
+                    codecs_file = upload_dir / f"{loop_name}.codecs"
+                    loop_codec = codecs_file.read_text(encoding="utf-8").strip() if codecs_file.exists() else None
+                media = [dict(m) for m in media_rows]  # raw rows kept for the per-item fallback
+            else:
+                # Mixed / has images → per-item, with built video runs (incl. the cyclic wrap-run)
+                # collapsed into single items.
+                media = _collapse_runs_for_view(media_rows, display_id, upload_dir)
+        except Exception:  # pragma: no cover - safety: never break the endpoint
+            playback_mode, loop_video, loop_codec = "per-item", None, None
+            media = [dict(m) for m in media_rows]
 
     return {
         "id": disp["id"],
@@ -282,7 +393,10 @@ def get_ambient_display(
         "announcement_title": disp["announcement_title"] or "",
         "announcement_enabled": disp["announcement_enabled"],
         "playlist_video": playlist_video,
-        "media": [dict(m) for m in media_rows],
+        "playback_mode": playback_mode,
+        "loop_video": loop_video,
+        "loop_codec": loop_codec,
+        "media": media,
     }
 
 
@@ -415,10 +529,17 @@ def delete_ambient_display(
             if poster.exists():
                 poster.unlink()
 
-    # Remove the BUILT concatenated loop video too (it's not an ambient_media row). Skip when the
-    # pointer is a single real clip URL — that file is already handled by the media loop above.
+    upload_dir = Path(settings.UPLOAD_DIR)
+    # Remove any legacy BUILT whole-playlist concat (not an ambient_media row).
     if _is_built_concat(disp["playlist_video_path"]):
-        _unlink_upload(Path(settings.UPLOAD_DIR), disp["playlist_video_path"])
+        _unlink_upload(upload_dir, disp["playlist_video_path"])
+    # Remove this display's built video-run clips (+ their posters) — also not ambient_media rows.
+    for p in upload_dir.glob(f"ambient-{display_id}-run-*"):
+        if p.exists():
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     db.execute("DELETE FROM ambient_displays WHERE id = ?", (display_id,))
     db.commit()
@@ -493,16 +614,19 @@ def upload_ambient_media(
         if media_type == "video":
             normalized_name = f"ambient-{display_id}-{ts}-{i}-norm.mp4"
             normalized_path = upload_dir / normalized_name
-            if normalize_video(filepath, normalized_path):
-                # Serve the normalized file; drop the raw upload (its bytes were never referenced by
-                # any URL, so removing it is safe and avoids leaving an orphan on disk).
+            # normalize_video is 3-state: 'written' (a -norm.mp4 was produced → serve it, drop the raw),
+            # 'skip' (source already H.264/yuv420p/<=1080p/<=30fps AND faststart → serve the ORIGINAL
+            # byte-for-byte; nothing written, raw KEPT), or 'failed' (serve the original as a fallback).
+            if normalize_video(filepath, normalized_path) == "written":
+                # Raw upload superseded by the -norm.mp4 (its bytes were never referenced by any URL).
                 try:
                     filepath.unlink()
                 except OSError:
                     pass
                 filename = normalized_name
                 filepath = normalized_path
-            poster_filename = f"{Path(filename).stem}-poster.jpg"
+            # 'skip'/'failed' → keep the ORIGINAL as the served file (filename/filepath unchanged).
+            poster_filename = f"{Path(filename).stem}-poster.png"  # lossless PNG cover (no soft poster)
             if extract_last_frame(filepath, upload_dir / poster_filename):
                 poster_path = f"/uploads/{poster_filename}"
 
