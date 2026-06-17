@@ -131,7 +131,6 @@ export function AmbientViewerPage() {
   const stateRef = useRef(STATE_IDLE);
   const currentItemTypeRef = useRef(null);
   const activeImageRef = useRef('A');
-  const imageZRef = useRef(2); // monotonic top z for the incoming image layer (see image→image flash fix)
   const swapTokenRef = useRef(0);
   const prefetchRef = useRef(new Map());
   const swapDeadlineRef = useRef(null);
@@ -626,38 +625,20 @@ export function AmbientViewerPage() {
       requestAnimationFrame(() => {
         if (!tokenValid(token)) return;
         logEvent('state', `image fade start [${fromKey}→${toKey}]`);
-        // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
-        // // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // nextImg.style.opacity = '1';
-        // // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
-        // prevImg.style.opacity = '0';
-        // setTimeout(() => {
-        //   if (!tokenValid(token)) return;
-        //   logEvent('state', `image fade end [${fromKey}→${toKey}]`);
-        //   activeImageRef.current = toKey;
-        //   finalizeSwap(token, nextItem, nextIdx);
-        // }, CROSSFADE_DURATION);
-        // Lift ONLY the incoming image (still opacity:0 → invisible → restacking it is flash-free) to an
-        // ever-increasing z so it's always above the outgoing. Equal-z ties break by DOM order (B over A),
-        // which is why alternate swaps cut instantly without this. We must NEVER change z on a VISIBLE
-        // layer: on Tizen that rebuilds the composited layer (willChange:opacity) and flashes black for
-        // ~1 frame — exactly the regression a fixed start-3/end-2 reset introduced.
-        imageZRef.current += 1;
-        nextImg.style.zIndex = String(imageZRef.current);
-        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        // Symmetric dual cross-dissolve, both layers via CSS transitions and NO z-index manipulation.
+        // ease-out on the incoming (rises fast) + ease-in on the outgoing (falls slow→fast) keeps total
+        // coverage high through the midpoint, so there's no visible dip. This is deliberately the proven
+        // original: transition-driven opacity changes ride the compositor (no Tizen flash), and the images
+        // stay at their resting z=2 — BELOW the poster (z=3) and the UI overlays (color band + announcement
+        // at z=10). The "fade-in-on-top" variants were reverted because keeping the incoming strictly above
+        // the outgoing every swap forced an ever-growing z-index that eventually painted over those z=10
+        // overlays (the color band vanished mid-loop). See changes.md (2026-06-17).
+        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
         nextImg.style.opacity = '1';
-        // old image stays solid underneath while the new one fades in on top
+        prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+        prevImg.style.opacity = '0';
         setTimeout(() => {
           if (!tokenValid(token)) return;
-          // Hide the outgoing via a TRANSITION (compositor path) — NOT an instant `transition:'none'`
-          // write. The instant write is what flashed black on Tizen (main-thread layer rebuild); the
-          // animated opacity change rides the compositor exactly like the smooth incoming fade, so it
-          // doesn't flash. It fades 1→0 invisibly behind the now-opaque incoming, and crucially still
-          // ENDS at opacity 0 — so only the active image stays opaque, which runImageToVideo relies on
-          // (it only fades the active image out to reveal the video; a second opaque image would occlude it).
-          prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease`;
-          prevImg.style.opacity = '0';
           logEvent('state', `image fade end [${fromKey}→${toKey}]`);
           activeImageRef.current = toKey;
           finalizeSwap(token, nextItem, nextIdx);

@@ -1108,70 +1108,77 @@ Any TRUE black at a video edge → escalate to the AVPlay `.wgt` (Approach 2 in 
 
 ---
 
-## 2026-06-17 — Fix: image→image ~100ms black flash on Tizen (composited-layer z-index rebuild)
+## 2026-06-17 — image→image transition: the "fade-in-on-top" detour and the revert to dual cross-dissolve
 
-**File:** `src/pages/AmbientViewerPage.jsx` (per-item engine, `runImageToImage` only).
+**File:** `src/pages/AmbientViewerPage.jsx` (per-item engine, `runImageToImage` only) — net effect:
+back to the proven symmetric cross-dissolve. This entry records the full chain so the dead ends aren't
+re-attempted.
 
-### Background (same session, two steps)
-1. **Smoothness fix (earlier):** the image→image crossfade was enhanced so the incoming image fades
-   in *on top of the still-solid outgoing image* (no mid-crossfade dip). Because both `<img>` layers
-   share `zIndex:2` (`layerStyle(2)`) and equal-z ties break by DOM order (`imageBRef` is after
-   `imageARef`, so B always paints over A), the "fade in on top" only worked when swapping *into B* —
-   swaps *into A* faded in *behind* the opaque B and then hard-cut, i.e. **alternate images (1,3,5)
-   cut instantly while 2,4,6 faded.** First fix lifted the incoming to `zIndex:3` during the fade and
-   **reset it to `2` at the end**.
-2. **This entry — the regression that reset introduced.** On the real Samsung panel that end-reset
-   produced a **subtle ~100ms black flash exactly when the new image settled** (not present before).
+### What we were trying to improve
+The image→image crossfade is the original **symmetric dual cross-dissolve**: incoming fades 0→1
+(`ease-out`) while outgoing fades 1→0 (`ease-in`); the easing pair keeps total coverage high through
+the midpoint, so there's no visible dip. It uses **no z-index** — both `<img>` layers rest at
+`zIndex:2` (`layerStyle(2)`). This "worked perfect." We tried to enhance it to a "new image fades in on
+top of the still-solid old image" look. That detour is what introduced (and then chased) two TV-only
+regressions before we reverted.
 
-### Root cause (confirmed)
-The `<img>` layers carry `willChange:'opacity'`, so each is its own GPU-composited layer. In the
-fade-end `setTimeout`, `prevImg.opacity='0'` is invisible (prevImg sits *behind* the now-opaque
-nextImg), so the only on-screen change came from `nextImg.style.zIndex = '2'`. **Changing z-index on a
-composited layer forces Tizen to tear down and rebuild that layer**, leaving ~1 frame unpainted → the
-black container shows through. Opacity changes never flash (that is precisely what `willChange:opacity`
-buys); **only a z-index change on a *visible* layer does.** The original dual-fade never flashed
-because it never touched z-index.
+### Attempt 1 — z-lift with end-reset (`start 3 / end 2`)
+"Fade in on top" needs the incoming strictly above the outgoing. Equal-z ties break by DOM order
+(`imageBRef` is after `imageARef` → B paints over A), so the on-top look only worked swapping *into B*;
+swaps *into A* faded in *behind* the opaque B and hard-cut — i.e. **alternate images cut instantly while
+the others faded.** Fix attempt: lift the incoming to `zIndex:3` during the fade, reset to `2` at the end.
+- **Broke:** a subtle **~100 ms black flash on the real Samsung panel exactly when the new image
+  settled** (fine on laptop). Root cause: the `<img>` layers carry `willChange:'opacity'` (each is a
+  GPU-composited layer); the fade-end `nextImg.style.zIndex='2'` change forces Tizen to **tear down and
+  rebuild that layer** → ~1 unpainted frame → black shows. Opacity changes never flash (that's what
+  `willChange:opacity` buys); **only a z-index change on a *visible* layer does.**
 
-### Why a fixed 2/3 scheme can't avoid it
-The two layers alternate which one is on top every swap, and DOM order breaks equal-z ties in B's
-favour. Keeping z bounded to {2,3} forces a z-write on a *visible* layer every other swap → flash. The
-only flash-free scheme is to write z **only to the incoming layer while it is still `opacity:0`
-(invisible)** and give it an **ever-incrementing** value so it is always above the outgoing — and to
-**never reset** (a reset is, by definition, a write to the now-visible layer).
+### Attempt 2 — monotonic z + transition-based hide
+To never restack a *visible* layer: write z **only to the incoming while it's still `opacity:0`**, with
+an **ever-incrementing** value so it's always above the outgoing, and never reset. Also changed the
+outgoing's fade-end hide from an instant `transition:'none'; opacity=0` (itself a flash source on Tizen)
+to a compositor-driven `opacity` transition.
+- **Fixed** the flash, **but broke worse:** the incoming's z climbs by 1 every swap, so after ~8
+  image→image swaps it passes the UI overlays (**color band and announcement are both `zIndex:10`**) and
+  the full-bleed opaque image **paints over them — the color band "disappeared after some time"**
+  (reproducible on laptop too; with ~30 images per loop it always climbs past 10 mid-loop). It also
+  pushed images above the poster (`z=3`), a plausible contributor to a faint "darker first image after
+  the video."
 
-### Fix
-- New ref `imageZRef = useRef(2)` — monotonic top-z for the incoming image layer.
-- In `runImageToImage`'s `beginCrossfade` rAF block: `imageZRef.current += 1;
-  nextImg.style.zIndex = String(imageZRef.current)` while nextImg is still `opacity:0`, then fade its
-  opacity in. **Removed** the start-time `prevImg.style.zIndex='2'` and the end-time
-  `nextImg.style.zIndex='2'` writes (both touched a visible/about-to-be-visible layer). The fade-end
-  `setTimeout` now only flips `prevImg` opacity — no z write.
-- `forceFinal` (decode timeout / onerror) left untouched: it hard-cuts opacity with no fade, so
-  stacking is irrelevant there.
+### Why the on-top look can't be cleanly bounded (the dead end)
+With two fixed DOM layers and DOM-order tie-breaking, keeping the incoming **strictly above** the
+outgoing every swap is only achievable by either (a) an **unbounded** climbing z (Attempt 2 → covers the
+z=10 overlays), or (b) a **bounded {2,3}** scheme that must write z to the **currently visible** layer
+each alternate swap (Attempt 1 → the Tizen recomposite flash). There is no bounded, flash-free, all-z
+solution for image-heavy / all-image playlists. So the enhancement was abandoned.
 
-### Safety against the other transitions (verified — no edits needed)
-Images only affect the screen when opaque, and when opaque they belong on top. With images floating at
-high z:
-- **video→image poster-freeze:** the original choreography revealed the image *beneath* the poster
-  (z=3) then cut the poster; with the image above the poster the end state is identical and still
-  flash-free — the image is opaque/full-screen on reveal, the video plane was already `opacity:0`, the
-  poster fades out underneath in the same rAF tick, and the reveal itself is an *opacity* flip (never
-  flashes); the image's z is not changed there.
-- **image→video / video→video:** image z only needs to be ≥ the video plane (z=1); images sit well
-  above it, and during video→video they are transparent so their z is irrelevant.
+### Resolution — revert to the dual cross-dissolve
+`runImageToImage` `beginCrossfade` restored to:
+```js
+nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
+nextImg.style.opacity = '1';
+prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+prevImg.style.opacity = '0';
+setTimeout(() => { … activeImageRef.current = toKey; finalizeSwap(…); }, CROSSFADE_DURATION);
+```
+Removed the `imageZRef` ref and all z-index manipulation. Both layers fade via CSS **transitions** (no
+instant `opacity`/`zIndex` writes → no Tizen flash) and images stay at **z=2** — below the poster (z=3)
+and the z=10 UI overlays. This simultaneously resolves all three reported symptoms:
+- **black flash** — gone (no instant writes, no z writes);
+- **color band / announcement disappearing** — gone (images never exceed z=2, overlays stay on top);
+- **darker first image after the video** — should improve (images back below the poster z=3 → restores
+  `runVideoToImage`'s "image beneath poster → hard-cut poster" stacking). If a faint darkness persists
+  on-panel it's a separate pre-existing Tizen video-plane/poster matter, minor and self-correcting.
 
 ### Also this session (unrelated, cosmetic)
 Announcement bar reduced to ~70% height: container `padding` and the label/name/title `fontSize` +
 `marginBottom` values lowered (previous values left commented inline as backups).
 
 ### Verification
-- `npm run build` clean (533 kB main bundle; only the pre-existing chunk-size warning).
-- Tizen panel, `?debug=true`, ≥6-image playlist, 2+ loops: every image→image transition crossfades
-  smoothly in BOTH directions with **no black flash** when the new image settles; `ERRORS:0`; mixing in
-  a video confirms video→image / image→video / loop wrap still look correct.
-
-### Rollback
-Single-file, single-function revert of `runImageToImage` + remove `imageZRef`.
+- `npm run build` clean (only the pre-existing chunk-size warning).
+- Rebuild + redeploy the frontend (TV build `07:29 UTC` predated these edits). On `?debug=true`, run a
+  full loop: image→image crossfades smoothly with no black flash; the **color band scrolls the entire
+  loop** (never disappears); announcement stays visible; loop-back to the video is clean; `ERRORS:0`.
 
 ---
 
