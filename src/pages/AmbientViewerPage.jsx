@@ -650,8 +650,14 @@ export function AmbientViewerPage() {
         // old image stays solid underneath while the new one fades in on top
         setTimeout(() => {
           if (!tokenValid(token)) return;
-          prevImg.style.transition = 'none'; // instantly hide old after new is fully visible
-          prevImg.style.opacity = '0';       // invisible (behind the opaque new image) — and NO z write here
+          // Hide the outgoing via a TRANSITION (compositor path) — NOT an instant `transition:'none'`
+          // write. The instant write is what flashed black on Tizen (main-thread layer rebuild); the
+          // animated opacity change rides the compositor exactly like the smooth incoming fade, so it
+          // doesn't flash. It fades 1→0 invisibly behind the now-opaque incoming, and crucially still
+          // ENDS at opacity 0 — so only the active image stays opaque, which runImageToVideo relies on
+          // (it only fades the active image out to reveal the video; a second opaque image would occlude it).
+          prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease`;
+          prevImg.style.opacity = '0';
           logEvent('state', `image fade end [${fromKey}→${toKey}]`);
           activeImageRef.current = toKey;
           finalizeSwap(token, nextItem, nextIdx);
