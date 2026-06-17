@@ -1721,21 +1721,26 @@ export function AmbientViewerPage() {
               style={{
                 background: 'rgba(5, 30, 50, 0.9)',
                 borderRadius: '15px 15px 0 0',
-                padding: 'clamp(6px, 1vh, 14px) 0',
+                // padding: 'clamp(4px, 0.6vh, 8px) 0',
+                // padding: 'clamp(6px, 1vh, 14px) 0',
+                padding: 'clamp(3px, 0.5vh, 8px) 0',
                 textAlign: 'center',
                 color: '#ffffff',
               }}
             >
-              <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}>
+              {/* <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}> */}
+              <div style={{ fontSize: 'clamp(7px, 0.8vw, 10px)', fontWeight: 400, opacity: 0.9, marginBottom: 2 }}>
                 {announcementLabel}
               </div>
+              {/* backup: <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}> */}
               {announcementName && (
-                <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}>
+                <div style={{ fontSize: 'clamp(9px, 1.2vw, 16px)', fontWeight: 700, marginBottom: 1 }}>
                   {announcementName}
                 </div>
               )}
+              {/* backup: <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}> */}
               {announcementTitle && (
-                <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}>
+                <div style={{ fontSize: 'clamp(8px, 0.9vw, 13px)', fontWeight: 700 }}>
                   {announcementTitle}
                 </div>
               )}
