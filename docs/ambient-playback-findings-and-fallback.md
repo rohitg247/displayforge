@@ -123,7 +123,8 @@ attribute (best-effort); the guaranteed escalation is AVPlay (§8).
 
 **Internal (in-repo evidence):**
 - `changes.md` — full 9-round Tizen black-screen history (2026-05-11 → 2026-06-15).
-- `change.md` — early dual-layer engine (Apr 2026); the image-skip + initial-loop-glitch fix.
+- `changes.md` Appendix (formerly `change.md`, since merged + deleted) — early dual-layer engine
+  (Apr 2026); the image-skip + initial-loop-glitch fix.
 - Git history of `src/pages/AmbientViewerPage.jsx`: `20c9794`, `2f35192`, `46c1da0`, `529a304`,
   `503daa2`, `34907a4`, `9681311`, `1fcf23a`, `e33fcb8`, `5a7293b`.
 - Backup viewers: `src/pages/AmbientViewerPage copy.jsx`, `…_REFERENCE.jsx`, `…copy 2.jsx`.

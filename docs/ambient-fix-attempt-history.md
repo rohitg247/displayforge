@@ -2,7 +2,8 @@
 
 _Authored: 2026-06-16. Companion to `docs/ambient-playback-findings-and-fallback.md` (which has the
 shipped design + sources). This file is the chronological causal chain: each attempt, the evidence that
-it failed, and why that pointed to the next one. Sourced from `changes.md`, `change.md`, and the git
+it failed, and why that pointed to the next one. Sourced from `changes.md` (incl. its Appendix of early
+before/after diffs, formerly `change.md`) and the git
 history of `src/pages/AmbientViewerPage.jsx`._
 
 ## How to count this

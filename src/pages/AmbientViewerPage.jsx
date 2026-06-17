@@ -131,6 +131,7 @@ export function AmbientViewerPage() {
   const stateRef = useRef(STATE_IDLE);
   const currentItemTypeRef = useRef(null);
   const activeImageRef = useRef('A');
+  const imageZRef = useRef(2); // monotonic top z for the incoming image layer (see image→image flash fix)
   const swapTokenRef = useRef(0);
   const prefetchRef = useRef(new Map());
   const swapDeadlineRef = useRef(null);
@@ -637,23 +638,24 @@ export function AmbientViewerPage() {
         //   activeImageRef.current = toKey;
         //   finalizeSwap(token, nextItem, nextIdx);
         // }, CROSSFADE_DURATION);
-        // Lift incoming above outgoing so "fade in on top" is symmetric for both A→B and B→A.
-        // Without this, equal zIndex falls back to DOM order (B always above A), making every
-        // other swap a hard cut (the incoming image fades in behind the opaque outgoing layer).
-        nextImg.style.zIndex = '3';
-        prevImg.style.zIndex = '2';
+        // Lift ONLY the incoming image (still opacity:0 → invisible → restacking it is flash-free) to an
+        // ever-increasing z so it's always above the outgoing. Equal-z ties break by DOM order (B over A),
+        // which is why alternate swaps cut instantly without this. We must NEVER change z on a VISIBLE
+        // layer: on Tizen that rebuilds the composited layer (willChange:opacity) and flashes black for
+        // ~1 frame — exactly the regression a fixed start-3/end-2 reset introduced.
+        imageZRef.current += 1;
+        nextImg.style.zIndex = String(imageZRef.current);
         nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         nextImg.style.opacity = '1';
-        // old image stays solid underneath while new fades in on top
+        // old image stays solid underneath while the new one fades in on top
         setTimeout(() => {
           if (!tokenValid(token)) return;
-          prevImg.style.transition = 'none'; // instantly hide old after new fully visible
-          prevImg.style.opacity = '0';
-          nextImg.style.zIndex = '2'; // restore resting stacking for other transitions
+          prevImg.style.transition = 'none'; // instantly hide old after new is fully visible
+          prevImg.style.opacity = '0';       // invisible (behind the opaque new image) — and NO z write here
           logEvent('state', `image fade end [${fromKey}→${toKey}]`);
           activeImageRef.current = toKey;
           finalizeSwap(token, nextItem, nextIdx);
-        }, CROSSFADE_DURATION);   
+        }, CROSSFADE_DURATION);
       });
     };
 
