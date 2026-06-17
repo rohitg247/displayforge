@@ -625,35 +625,16 @@ export function AmbientViewerPage() {
       requestAnimationFrame(() => {
         if (!tokenValid(token)) return;
         logEvent('state', `image fade start [${fromKey}→${toKey}]`);
-        // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
-        // // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // nextImg.style.opacity = '1';
-        // // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
-        // prevImg.style.opacity = '0';
-        // setTimeout(() => {
-        //   if (!tokenValid(token)) return;
-        //   logEvent('state', `image fade end [${fromKey}→${toKey}]`);
-        //   activeImageRef.current = toKey;
-        //   finalizeSwap(token, nextItem, nextIdx);
-        // }, CROSSFADE_DURATION);
-        // Lift incoming above outgoing so "fade in on top" is symmetric for both A→B and B→A.
-        // Without this, equal zIndex falls back to DOM order (B always above A), making every
-        // other swap a hard cut (the incoming image fades in behind the opaque outgoing layer).
-        nextImg.style.zIndex = '3';
-        prevImg.style.zIndex = '2';
         nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         nextImg.style.opacity = '1';
-        // old image stays solid underneath while new fades in on top
+        prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        prevImg.style.opacity = '0';
         setTimeout(() => {
           if (!tokenValid(token)) return;
-          prevImg.style.transition = 'none'; // instantly hide old after new fully visible
-          prevImg.style.opacity = '0';
-          nextImg.style.zIndex = '2'; // restore resting stacking for other transitions
           logEvent('state', `image fade end [${fromKey}→${toKey}]`);
           activeImageRef.current = toKey;
           finalizeSwap(token, nextItem, nextIdx);
-        }, CROSSFADE_DURATION);   
+        }, CROSSFADE_DURATION);
       });
     };
 
@@ -753,11 +734,9 @@ export function AmbientViewerPage() {
         } else {
           // Legacy fallback (no poster): crossfade the next image in over the still-displayed video.
           logEvent('state', `image fade start [video→${toKey}]`);
-          nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
-          // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+          nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
           nextImg.style.opacity = '1';
-          // v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-          v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+          v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
           v.style.opacity = '0';
           logEvent('lifecycle', 'video opacity 1→0');
           setTimeout(() => {
@@ -828,9 +807,9 @@ export function AmbientViewerPage() {
       if (paintable) {
         logEvent('state', `image fade out [${activeKey}]`);
         logEvent('state', 'video fade in');
-        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
+        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         v.style.opacity = '1';
-        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         activeImg.style.opacity = '0';
         setTimeout(() => {
           if (!tokenValid(token)) return;
@@ -861,9 +840,9 @@ export function AmbientViewerPage() {
         if (!tokenValid(token)) return;
         logEvent('state', `image fade out [${activeKey}]`);
         logEvent('state', 'video fade in');
-        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
+        v.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         v.style.opacity = '1';
-        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+        activeImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         activeImg.style.opacity = '0';
         setTimeout(() => {
           if (!tokenValid(token)) return;
@@ -1417,11 +1396,8 @@ export function AmbientViewerPage() {
 
   const orientation = display?.orientation || 'landscape';
   const colorBarHeight = orientation === 'portrait'
-  ? 'clamp(12px, 2vh, 25px)'
-  : 'clamp(16px, 2.5vh, 35px)';
-  // const colorBarHeight = orientation === 'portrait'
-  //   ? 'clamp(8px, 1.35vh, 15px)'
-  //   : 'clamp(10px, 1.8vh, 20px)';
+    ? 'clamp(8px, 1.35vh, 15px)'
+    : 'clamp(10px, 1.8vh, 20px)';
 
   const containerStyle = useMemo(() => {
     if (orientation === 'portrait') {

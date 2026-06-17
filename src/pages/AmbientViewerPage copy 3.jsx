@@ -625,35 +625,18 @@ export function AmbientViewerPage() {
       requestAnimationFrame(() => {
         if (!tokenValid(token)) return;
         logEvent('state', `image fade start [${fromKey}→${toKey}]`);
-        // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
-        // // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // nextImg.style.opacity = '1';
-        // // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
-        // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
-        // prevImg.style.opacity = '0';
-        // setTimeout(() => {
-        //   if (!tokenValid(token)) return;
-        //   logEvent('state', `image fade end [${fromKey}→${toKey}]`);
-        //   activeImageRef.current = toKey;
-        //   finalizeSwap(token, nextItem, nextIdx);
-        // }, CROSSFADE_DURATION);
-        // Lift incoming above outgoing so "fade in on top" is symmetric for both A→B and B→A.
-        // Without this, equal zIndex falls back to DOM order (B always above A), making every
-        // other swap a hard cut (the incoming image fades in behind the opaque outgoing layer).
-        nextImg.style.zIndex = '3';
-        prevImg.style.zIndex = '2';
-        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-out`;
+        // nextImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
         nextImg.style.opacity = '1';
-        // old image stays solid underneath while new fades in on top
+        // prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in-out`;
+        prevImg.style.transition = `opacity ${CROSSFADE_DURATION}ms ease-in`;
+        prevImg.style.opacity = '0';
         setTimeout(() => {
           if (!tokenValid(token)) return;
-          prevImg.style.transition = 'none'; // instantly hide old after new fully visible
-          prevImg.style.opacity = '0';
-          nextImg.style.zIndex = '2'; // restore resting stacking for other transitions
           logEvent('state', `image fade end [${fromKey}→${toKey}]`);
           activeImageRef.current = toKey;
           finalizeSwap(token, nextItem, nextIdx);
-        }, CROSSFADE_DURATION);   
+        }, CROSSFADE_DURATION);
       });
     };
 
