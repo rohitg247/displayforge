@@ -1,13 +1,16 @@
 import jwt
 from datetime import datetime, timedelta, timezone
+from typing import Optional
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from .config import settings
 
 ph = PasswordHasher()
-security = HTTPBearer()
+# auto_error=False: a missing Authorization header is NOT an instant 401 — we then fall back to the
+# httpOnly session cookie (set on login), so a preview popup tab is authenticated without the token.
+security = HTTPBearer(auto_error=False)
 
 
 def hash_password(password: str) -> str:
@@ -43,6 +46,12 @@ def decode_token(token: str) -> dict:
 
 
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
 ) -> dict:
-    return decode_token(credentials.credentials)
+    # Prefer the Bearer header (existing behaviour); fall back to the httpOnly session cookie so a
+    # same-origin preview popup (no per-tab token) is still authenticated.
+    token = credentials.credentials if credentials else request.cookies.get(settings.AUTH_COOKIE_NAME)
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    return decode_token(token)

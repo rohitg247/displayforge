@@ -1204,6 +1204,66 @@ Documentation + dead-code cleanup only — **no playback-logic change** (the v4 
 
 ---
 
+## 2026-06-18 — Phase 2: admin draft-staging publish workflow + auth fix + orientation gate + admin UX
+
+**Files:** `server/schema.sql`, `server/database.py`, `migrate.py`, `server/models.py`, `server/config.py`,
+`server/auth.py`, `server/routers/auth_router.py`, `server/routers/ambient_router.py`,
+`server/media_utils.py`, `server/backfill_posters.py`, `src/services/api.js`, `src/context/AppContext.jsx`,
+`src/pages/AmbientDisplaysPage.jsx`, `src/components/AmbientOrientationGate.jsx` (new), `src/App.jsx`.
+**Hard constraint honoured:** `src/pages/AmbientViewerPage.jsx` is **not modified** (empty git diff).
+
+### A. Draft-staging publish workflow ("stage all edits, apply on Publish")
+The live link must only change on Publish; the preview link shows the working draft; the viewer's 5s poll
++ `applyPendingIfNeeded` blends the change at the next item (no reset).
+- **Schema (idempotent):** `ambient_displays.draft_orientation` + `draft_announcement_{label,name,title,enabled}`;
+  `ambient_media.live_sort_order` (published order) + `draft_removed` (staged delete) + `thumb_path`.
+  Seeded = live values, so existing displays are unchanged until edited.
+- **`GET /ambient/{id}`:** admin/preview → **working** view (draft display fields under the normal keys;
+  media `draft_removed=0` in `sort_order`, incl. drafts). Live → **published snapshot** (`status='live'`
+  in `COALESCE(live_sort_order, sort_order)`). Same JSON shape → viewer untouched. Also returns `is_live`
+  + `has_unpublished_changes`.
+- **`PUT /ambient/{id}`** writes announcement/orientation to the **draft_** columns. **Reorder** writes
+  `sort_order` only (no live regen). **Delete** of a live item sets `draft_removed=1` (kept live until
+  publish); a draft-only item is removed immediately. **Publish** hard-deletes `draft_removed` rows +
+  files, promotes the playlist to live, sets `live_sort_order = sort_order`, copies `draft_*` → live, and
+  regenerates the joined clips from the published order. List endpoint returns draft (working) values.
+- **Admin UI:** Publish button always available with state — `Publish X Live` (not live) /
+  `● LIVE` + `Publish changes` (live, dirty) / `● LIVE — up to date`. Draft badge (`status==='draft'`)
+  now syncs because publish promotes correctly.
+
+### B. Preview "not authenticated" fix (industry-level)
+Token was JWT Bearer in **sessionStorage** (per-tab) → the `window.open` preview popup had no token → 401.
+Now: login also sets an **httpOnly `actis_session` cookie**; `get_current_user` accepts the cookie **or**
+the Bearer header (`HTTPBearer(auto_error=False)` + cookie fallback); the client token moved to
+**localStorage** (shared across same-origin tabs) and `fetch` sends `credentials:'include'`. Added
+`POST /api/auth/logout`. New config: `AUTH_COOKIE_NAME/SECURE/SAMESITE` (set `AUTH_COOKIE_SECURE=true` on HTTPS).
+
+### C–E, G. Admin UX
+- **Media-list layout** follows `display.orientation` (portrait → 9:16 tiles, landscape → 16:9).
+- **Video first-frame thumbnails:** `media_utils.extract_first_frame` on upload → `thumb_path`;
+  `backfill_posters.py --thumbs` for existing videos; admin renders the thumb (Film icon fallback).
+- **Hover-to-preview:** 2s hover on a tile opens an enlarged modal (image or muted autoplay video);
+  mouse-out / drag-start closes it.
+- **Megaphone** is the "announcement enabled" indicator on the admin card (added a tooltip). Fixed the
+  admin `API_BASE` `:8000` fallback → relative (proxied), so thumbnails load without `VITE_API_URL`.
+
+### F. Orientation gate (no viewer edits)
+New `src/components/AmbientOrientationGate.jsx` wraps the viewer route in `App.jsx`. It compares the
+**device** orientation (`matchMedia`) to the display's **configured** orientation (its own light fetch)
+and overlays a polished "This display is set to {Portrait|Landscape} — please view it on a … screen"
+message on mismatch (live view only; preview never gated). The viewer stays mounted underneath
+(`position:fixed` overlay, framer-motion, no theme/TOD deps — index.css left untouched so admin scrolling
+is unaffected). The copy-reference files (`OrientationGate.jsx`, `ORIENTATION-GATE-FINAL.md`, `tod*.js`)
+were deleted.
+
+### Deploy
+Rebuild backend (`init_db` adds the columns) and run `python -m server.backfill_posters --thumbs` once for
+existing videos. New uploads get thumbnails automatically. Status: `npm run build`/`lint`, `py_compile`,
+`migrate.py`, and FastAPI app-import all green; the viewer is untouched. On-device + end-to-end admin
+verification is the next step.
+
+---
+
 # Appendix — Code Snippet Diffs (merged from change.md)
 
 _Merged from the former `change.md` (2026-06-17). This appendix documents early edit sessions as exact

@@ -1,7 +1,9 @@
 const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8888';
 
 function getToken() {
-  return sessionStorage.getItem('actis_token');
+  // localStorage (shared across same-origin tabs) so a preview popup inherits the token; the httpOnly
+  // session cookie (sent via credentials:'include') is the primary auth, this is the Bearer fallback.
+  return localStorage.getItem('actis_token');
 }
 
 async function request(path, options = {}) {
@@ -12,10 +14,10 @@ async function request(path, options = {}) {
     headers['Content-Type'] = 'application/json';
   }
 
-  const res = await fetch(`${API_BASE}${path}`, { ...options, headers });
+  const res = await fetch(`${API_BASE}${path}`, { ...options, headers, credentials: 'include' });
 
   if (res.status === 401) {
-    sessionStorage.removeItem('actis_token');
+    localStorage.removeItem('actis_token');
     window.location.href = '/admin/login';
     throw new Error('Unauthorized');
   }
@@ -42,6 +44,8 @@ export const api = {
       method: 'POST',
       body: JSON.stringify({ email, password }),
     }),
+  logout: () =>
+    request('/api/auth/logout', { method: 'POST' }).catch(() => {}),
 
   // Tree (full nested data)
   getBranchesTree: () => request('/api/branches/tree'),

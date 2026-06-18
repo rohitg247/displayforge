@@ -18,7 +18,7 @@ from ..models import (
     ActivePlaylistRequest,
     PublishPlaylistRequest,
 )
-from ..media_utils import extract_last_frame, normalize_video, build_video_run, build_mse_loop
+from ..media_utils import extract_last_frame, extract_first_frame, normalize_video, build_video_run, build_mse_loop
 
 router = APIRouter()
 
@@ -216,7 +216,7 @@ def _regenerate_playlist_video(db: sqlite3.Connection, display_id: int) -> None:
     rows = db.execute(
         """SELECT file_path, media_type, playlist, sort_order FROM ambient_media
            WHERE ambient_display_id = ? AND playlist = ? AND status = 'live'
-           ORDER BY sort_order, id""",
+           ORDER BY COALESCE(live_sort_order, sort_order), id""",
         (display_id, playlist),
     ).fetchall()
 
@@ -267,12 +267,18 @@ def list_ambient_displays(
     db: sqlite3.Connection = Depends(db_dependency),
     user: dict = Depends(get_current_user),
 ):
+    # Admin list = the WORKING (draft) view: orientation + announcement come from the draft_* columns
+    # (falling back to live when a draft was never set), so the cards/edit form reflect unpublished edits.
+    # media_count counts only the working set (excludes items staged for removal).
     rows = db.execute(
         """
-        SELECT ad.id, ad.branch_id, ad.name, ad.orientation, ad.active_playlist,
-               ad.announcement_label, ad.announcement_name, ad.announcement_title,
-               ad.announcement_enabled,
-               COUNT(am.id) AS media_count
+        SELECT ad.id, ad.branch_id, ad.name, ad.active_playlist,
+               COALESCE(ad.draft_orientation, ad.orientation)                   AS orientation,
+               COALESCE(ad.draft_announcement_label, ad.announcement_label)     AS announcement_label,
+               COALESCE(ad.draft_announcement_name, ad.announcement_name)       AS announcement_name,
+               COALESCE(ad.draft_announcement_title, ad.announcement_title)     AS announcement_title,
+               COALESCE(ad.draft_announcement_enabled, ad.announcement_enabled) AS announcement_enabled,
+               COUNT(CASE WHEN am.draft_removed = 0 THEN am.id END) AS media_count
         FROM ambient_displays ad
         LEFT JOIN ambient_media am ON am.ambient_display_id = ad.id
         GROUP BY ad.id ORDER BY ad.id
@@ -329,22 +335,29 @@ def get_ambient_display(
     if not disp:
         raise HTTPException(status_code=404, detail="Ambient display not found")
 
-    status_filter = "" if admin else "AND status = 'live'"  # ← key line
+    # Draft-staging: the admin/preview ("working") view shows everything not pending-removal, in the
+    # working order (sort_order). The live (published) view shows only status='live' media in the
+    # PUBLISHED order (live_sort_order) — staged reorders/adds/deletes don't reach it until Publish.
+    if admin:
+        row_filter = "AND draft_removed = 0"
+        order_expr = "sort_order"
+    else:
+        row_filter = "AND status = 'live'"
+        order_expr = "COALESCE(live_sort_order, sort_order)"
 
+    cols = "id, ambient_display_id, file_path, media_type, playlist, sort_order, live_sort_order, draft_removed, status, poster_path, thumb_path, duration"
     if playlist and playlist in ("A", "B"):
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path, duration
-                FROM ambient_media
-                WHERE ambient_display_id = ? AND playlist = ? {status_filter}
-                ORDER BY sort_order, id""",
+            f"""SELECT {cols} FROM ambient_media
+                WHERE ambient_display_id = ? AND playlist = ? {row_filter}
+                ORDER BY {order_expr}, id""",
             (display_id, playlist),
         ).fetchall()
     else:
         media_rows = db.execute(
-            f"""SELECT id, ambient_display_id, file_path, media_type, playlist, sort_order, status, poster_path, duration
-                FROM ambient_media
-                WHERE ambient_display_id = ? {status_filter}
-                ORDER BY sort_order, id""",
+            f"""SELECT {cols} FROM ambient_media
+                WHERE ambient_display_id = ? {row_filter}
+                ORDER BY {order_expr}, id""",
             (display_id,),
         ).fetchall()
 
@@ -382,16 +395,59 @@ def get_ambient_display(
             playback_mode, loop_video, loop_codec = "per-item", None, None
             media = [dict(m) for m in media_rows]
 
+    # Admin/preview reads the DRAFT (working) config under the normal keys; live reads the published
+    # columns. (COALESCE-style: a draft field that is NULL falls back to its live value.) Empty strings
+    # and 0 are valid draft values, so test `is not None` rather than truthiness.
+    def _draft(field):
+        dv = disp[f"draft_{field}"]
+        return dv if dv is not None else disp[field]
+
+    if admin:
+        orientation = _draft("orientation")
+        ann_label = _draft("announcement_label")
+        ann_name = _draft("announcement_name")
+        ann_title = _draft("announcement_title")
+        ann_enabled = _draft("announcement_enabled")
+    else:
+        orientation = disp["orientation"]
+        ann_label = disp["announcement_label"]
+        ann_name = disp["announcement_name"]
+        ann_title = disp["announcement_title"]
+        ann_enabled = disp["announcement_enabled"]
+
+    # Publish-state flags for the admin UI (only meaningful when a specific playlist is requested).
+    is_live = None
+    has_unpublished_changes = None
+    if admin and playlist in ("A", "B"):
+        is_live = playlist == disp["active_playlist"]
+        media_changes = db.execute(
+            """SELECT COUNT(*) AS c FROM ambient_media
+               WHERE ambient_display_id = ? AND playlist = ?
+                 AND (status = 'draft' OR draft_removed = 1
+                      OR (status = 'live' AND COALESCE(live_sort_order, sort_order) != sort_order))""",
+            (display_id, playlist),
+        ).fetchone()["c"]
+        config_changed = (
+            _draft("orientation") != disp["orientation"]
+            or _draft("announcement_label") != disp["announcement_label"]
+            or _draft("announcement_name") != disp["announcement_name"]
+            or _draft("announcement_title") != disp["announcement_title"]
+            or _draft("announcement_enabled") != disp["announcement_enabled"]
+        )
+        has_unpublished_changes = (not is_live) or media_changes > 0 or config_changed
+
     return {
         "id": disp["id"],
         "branch_id": disp["branch_id"],
         "name": disp["name"],
-        "orientation": disp["orientation"],
+        "orientation": orientation,
         "active_playlist": disp["active_playlist"],
-        "announcement_label": disp["announcement_label"] or "Actis welcomes",
-        "announcement_name": disp["announcement_name"] or "",
-        "announcement_title": disp["announcement_title"] or "",
-        "announcement_enabled": disp["announcement_enabled"],
+        "announcement_label": ann_label or "Actis welcomes",
+        "announcement_name": ann_name or "",
+        "announcement_title": ann_title or "",
+        "announcement_enabled": ann_enabled,
+        "is_live": is_live,
+        "has_unpublished_changes": has_unpublished_changes,
         "playlist_video": playlist_video,
         "playback_mode": playback_mode,
         "loop_video": loop_video,
@@ -411,21 +467,28 @@ def update_ambient_display(
     if not disp:
         raise HTTPException(status_code=404, detail="Ambient display not found")
 
+    # Draft-staging: announcement + orientation edits write to the DRAFT columns only. They surface on
+    # the preview link (admin reads draft) and reach the live link solely via Publish. `name` is not a
+    # broadcast concern (admin label), so it stays on the live column. `active_playlist` is owned by
+    # publish/switch endpoints and intentionally not changed here.
     name = body.name.strip() if body.name is not None else disp["name"]
-    orientation = body.orientation if body.orientation in ("landscape", "portrait") else disp["orientation"]
-    active_playlist = body.active_playlist if body.active_playlist in ("A", "B") else disp["active_playlist"]
-    announcement_label = body.announcement_label if body.announcement_label is not None else disp["announcement_label"]
-    announcement_name = body.announcement_name if body.announcement_name is not None else disp["announcement_name"]
-    announcement_title = body.announcement_title if body.announcement_title is not None else disp["announcement_title"]
-    announcement_enabled = body.announcement_enabled if body.announcement_enabled is not None else disp["announcement_enabled"]
+
+    def _cur_draft(field):
+        dv = disp[f"draft_{field}"]
+        return dv if dv is not None else disp[field]
+
+    draft_orientation = body.orientation if body.orientation in ("landscape", "portrait") else _cur_draft("orientation")
+    draft_label = body.announcement_label if body.announcement_label is not None else _cur_draft("announcement_label")
+    draft_name = body.announcement_name if body.announcement_name is not None else _cur_draft("announcement_name")
+    draft_title = body.announcement_title if body.announcement_title is not None else _cur_draft("announcement_title")
+    draft_enabled = body.announcement_enabled if body.announcement_enabled is not None else _cur_draft("announcement_enabled")
 
     db.execute(
         """UPDATE ambient_displays
-           SET name = ?, orientation = ?, active_playlist = ?,
-               announcement_label = ?, announcement_name = ?, announcement_title = ?,
-               announcement_enabled = ?
+           SET name = ?, draft_orientation = ?, draft_announcement_label = ?,
+               draft_announcement_name = ?, draft_announcement_title = ?, draft_announcement_enabled = ?
            WHERE id = ?""",
-        (name, orientation, active_playlist, announcement_label, announcement_name, announcement_title, announcement_enabled, display_id),
+        (name, draft_orientation, draft_label, draft_name, draft_title, draft_enabled, display_id),
     )
     db.commit()
 
@@ -433,16 +496,17 @@ def update_ambient_display(
         "SELECT COUNT(*) AS cnt FROM ambient_media WHERE ambient_display_id = ?", (display_id,)
     ).fetchone()["cnt"]
 
+    # Echo back the DRAFT (working) values so the admin form reflects what was just saved.
     return {
         "id": display_id,
         "branch_id": disp["branch_id"],
         "name": name,
-        "orientation": orientation,
-        "active_playlist": active_playlist,
-        "announcement_label": announcement_label or "Actis welcomes",
-        "announcement_name": announcement_name or "",
-        "announcement_title": announcement_title or "",
-        "announcement_enabled": announcement_enabled,
+        "orientation": draft_orientation,
+        "active_playlist": disp["active_playlist"],
+        "announcement_label": draft_label or "Actis welcomes",
+        "announcement_name": draft_name or "",
+        "announcement_title": draft_title or "",
+        "announcement_enabled": draft_enabled,
         "media_count": media_count,
     }
 
@@ -482,24 +546,42 @@ def publish_playlist(
 
     other_playlist = "B" if body.playlist == "A" else "A"
 
-    # Promote selected playlist draft → live
+    # 1. Commit staged DELETES: hard-remove rows marked draft_removed in the target playlist (+ their files).
+    removed = db.execute(
+        "SELECT id, file_path, poster_path, thumb_path FROM ambient_media WHERE ambient_display_id = ? AND playlist = ? AND draft_removed = 1",
+        (display_id, body.playlist),
+    ).fetchall()
+    for m in removed:
+        for col in ("file_path", "poster_path", "thumb_path"):
+            if m[col]:
+                _unlink_upload(Path(settings.UPLOAD_DIR), m[col])
+        db.execute("DELETE FROM ambient_media WHERE id = ?", (m["id"],))
+
+    # 2. Promote target playlist draft → live and commit the working order as the published order.
     db.execute(
-        "UPDATE ambient_media SET status = 'live' WHERE ambient_display_id = ? AND playlist = ?",
+        "UPDATE ambient_media SET status = 'live', live_sort_order = sort_order, draft_removed = 0 WHERE ambient_display_id = ? AND playlist = ?",
         (display_id, body.playlist),
     )
-    # Demote other playlist live → draft
+    # 3. Demote the other playlist live → draft (A/B swap, unchanged behaviour).
     db.execute(
         "UPDATE ambient_media SET status = 'draft' WHERE ambient_display_id = ? AND playlist = ?",
         (display_id, other_playlist),
     )
-    # Set active_playlist
+    # 4. Promote the staged display config (orientation + announcement) draft → live, set active playlist.
     db.execute(
-        "UPDATE ambient_displays SET active_playlist = ? WHERE id = ?",
+        """UPDATE ambient_displays
+           SET active_playlist = ?,
+               orientation          = COALESCE(draft_orientation, orientation),
+               announcement_label   = COALESCE(draft_announcement_label, announcement_label),
+               announcement_name    = COALESCE(draft_announcement_name, announcement_name),
+               announcement_title   = COALESCE(draft_announcement_title, announcement_title),
+               announcement_enabled = COALESCE(draft_announcement_enabled, announcement_enabled)
+           WHERE id = ?""",
         (body.playlist, display_id),
     )
     db.commit()
 
-    # Live content just changed — rebuild the single concatenated loop video for the panel.
+    # Live content just changed — rebuild the lossless joined clips for the panel from the published set.
     _regenerate_playlist_video(db, display_id)
 
     return {"status": "ok", "active_playlist": body.playlist}
@@ -611,6 +693,7 @@ def upload_ambient_media(
         # best-effort: if ffmpeg is missing or fails we keep the original upload, and (respectively)
         # leave poster_path NULL so the viewer degrades to its canvas bridge.
         poster_path = None
+        thumb_path = None
         if media_type == "video":
             normalized_name = f"ambient-{display_id}-{ts}-{i}-norm.mp4"
             normalized_path = upload_dir / normalized_name
@@ -629,14 +712,18 @@ def upload_ambient_media(
             poster_filename = f"{Path(filename).stem}-poster.png"  # lossless PNG cover (no soft poster)
             if extract_last_frame(filepath, upload_dir / poster_filename):
                 poster_path = f"/uploads/{poster_filename}"
+            # First-frame still for the admin media-list tile (best-effort; falls back to the Film icon).
+            thumb_filename = f"{Path(filename).stem}-thumb.jpg"
+            if extract_first_frame(filepath, upload_dir / thumb_filename):
+                thumb_path = f"/uploads/{thumb_filename}"
 
         # Per-image on-screen seconds (images only; NULL for video → uses its own length).
         duration = _parse_duration(i) if media_type == "image" else None
 
         sort_order = max_order + 1 + i
         cursor = db.execute(
-            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order, poster_path, duration) VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order, poster_path, duration),
+            "INSERT INTO ambient_media (ambient_display_id, file_path, media_type, playlist, sort_order, poster_path, thumb_path, duration) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (display_id, f"/uploads/{filename}", media_type, playlist, sort_order, poster_path, thumb_path, duration),
         )
         db.commit()
         uploaded.append({
@@ -648,6 +735,7 @@ def upload_ambient_media(
             "sort_order": sort_order,
             "status": "draft",
             "poster_path": poster_path,
+            "thumb_path": thumb_path,
             "duration": duration,
         })
 
@@ -661,13 +749,15 @@ def reorder_ambient_media(
     db: sqlite3.Connection = Depends(db_dependency),
     user: dict = Depends(get_current_user),
 ):
+    # Draft-staging: reorder writes the WORKING order (sort_order) only. The published order
+    # (live_sort_order) and the panel's joined clips are untouched until Publish — so the live link
+    # keeps playing its current order with no disturbance.
     for idx, media_id in enumerate(body.media_ids):
         db.execute(
             "UPDATE ambient_media SET sort_order = ? WHERE id = ? AND ambient_display_id = ?",
             (idx, media_id, display_id),
         )
     db.commit()
-    _regenerate_playlist_video(db, display_id)
     return {"status": "ok"}
 
 
@@ -681,18 +771,21 @@ def delete_ambient_media(
     if not media:
         raise HTTPException(status_code=404, detail="Media not found")
 
-    filepath = Path(settings.UPLOAD_DIR) / Path(media["file_path"]).name
-    if filepath.exists():
-        filepath.unlink()
+    # Draft-staging: a PUBLISHED (live) item is only marked for removal — it stays on the live link
+    # until Publish (which hard-deletes it + its files). A draft-only item (never published) is removed
+    # immediately. Either way it disappears from the admin/preview working view at once.
+    if media["status"] == "live":
+        db.execute("UPDATE ambient_media SET draft_removed = 1 WHERE id = ?", (media_id,))
+        db.commit()
+        return
 
-    if media["poster_path"]:
-        poster = Path(settings.UPLOAD_DIR) / Path(media["poster_path"]).name
-        if poster.exists():
-            poster.unlink()
-
+    for col in ("file_path", "poster_path", "thumb_path"):
+        if media[col]:
+            f = Path(settings.UPLOAD_DIR) / Path(media[col]).name
+            if f.exists():
+                f.unlink()
     db.execute("DELETE FROM ambient_media WHERE id = ?", (media_id,))
     db.commit()
-    _regenerate_playlist_video(db, media["ambient_display_id"])
 
 
 # ----------------------------------------------------------------------------------------------

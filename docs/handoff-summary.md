@@ -101,3 +101,43 @@ the first loop, and SSSP is deprecated since Tizen 6.5 — full runbook + caveat
 - On the panel with `?debug=true`: `MODE: per-item engine` (or `mse-loop ✓` for all-video), `ERRORS: 0`,
   no stall at the old seam timestamps, every transition + the loop is freeze-or-clean (no true black).
   Read the transcript at the viewer-origin `…/debug-log/latest` URL.
+
+---
+
+## 2026-06-18 — Phase 2: admin panel draft-staging + orientation gate (NOT yet device-verified)
+
+A separate workstream from the viewer engine. **`AmbientViewerPage.jsx` was deliberately NOT touched**
+(confirmed by an empty `git diff` on it). All viewer-facing behaviour is driven from the backend
+(serving *draft* values to `admin=true`/preview under the same JSON keys the viewer already reads) and a
+route-level wrapper in `App.jsx`.
+
+**What changed**
+1. **Draft-staging publish workflow** (issues 1,2,3,5). New columns: `ambient_displays.draft_orientation`
+   + `draft_announcement_*`; `ambient_media.live_sort_order` + `draft_removed` + `thumb_path`
+   (`schema.sql`/`database.py`/`migrate.py`, idempotent, seeded = live so existing displays are
+   unchanged). All edits (add/delete/reorder + announcement + orientation) stage as **draft** → visible
+   on the **Preview** link only; the **live** link changes solely on **Publish**, which the viewer's 5s
+   poll + `applyPendingIfNeeded` blends at the next item. `GET /ambient/{id}` now serves the working
+   view to admin and the published snapshot (status='live', `live_sort_order`) to live, and returns
+   `is_live` + `has_unpublished_changes`. Publish promotes the working set, commits `live_sort_order`,
+   hard-deletes `draft_removed` rows + files, and copies `draft_*` display fields → live. The admin
+   Publish button is always available with state (`Publish X Live` / `Publish changes` / `LIVE — up to date`).
+2. **Auth fix** (issue 8) — login also sets an **httpOnly `actis_session` cookie**; `get_current_user`
+   accepts cookie **or** Bearer; token moved to **localStorage** (shared across tabs) + fetch sends
+   `credentials:'include'`. The preview popup is now authenticated in every environment. Added
+   `POST /api/auth/logout`. Set `AUTH_COOKIE_SECURE=true` in prod (HTTPS).
+3. **Media-list layout** (issue 6) follows `display.orientation` (portrait → 9:16 tiles).
+4. **Video first-frame thumbnails** (issue 10) — `media_utils.extract_first_frame` on upload →
+   `thumb_path`; `backfill_posters.py --thumbs` for existing videos.
+5. **Hover-to-preview** (issue 9) — 2s hover on a media tile opens an enlarged modal; mouse-out closes.
+6. **Orientation gate** (new `src/components/AmbientOrientationGate.jsx`, wraps the viewer route in
+   `App.jsx`) — overlays "This display is set to {Portrait|Landscape} — please view it on a … screen"
+   when the device orientation ≠ the configured orientation (live view only; preview is never gated).
+   framer-motion only, no theme/TOD deps. The reference files (`OrientationGate.jsx`,
+   `ORIENTATION-GATE-FINAL.md`, `tod*.js`) were deleted.
+7. **Megaphone** (issue 7) is just the "announcement enabled" indicator on the admin card (now with a
+   tooltip). `API_BASE` `:8000` fallback in the admin page fixed to relative.
+
+**Deploy note:** rebuild backend (`init_db` adds the columns) and run
+`python -m server.backfill_posters --thumbs` once for existing videos' thumbnails. Status: builds/lint/
+py_compile/migrate/app-import all green; **on-device + end-to-end admin flow not yet verified.**

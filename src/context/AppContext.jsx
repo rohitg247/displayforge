@@ -18,7 +18,11 @@ function appReducer(state, action) {
       return { ...state, isAuthenticated: true, user: action.payload };
 
     case 'LOGOUT':
-      sessionStorage.removeItem('actis_token');
+      // localStorage (not sessionStorage) so the token is shared across same-origin tabs — a preview
+      // popup opened via window.open inherits it and can publish without a 401. The httpOnly session
+      // cookie set on login is the primary auth; this is the cross-origin-dev Bearer fallback.
+      localStorage.removeItem('actis_token');
+      api.logout?.();  // best-effort: clear the server-side httpOnly cookie
       return { ...initialState, loading: false };
 
     case 'INIT_DATA':
@@ -42,7 +46,7 @@ export function AppProvider({ children }) {
 
   // Load data on mount if token exists
   useEffect(() => {
-    const token = sessionStorage.getItem('actis_token');
+    const token = localStorage.getItem('actis_token');
     if (token) {
       api
         .getBranchesTree()
@@ -60,7 +64,7 @@ export function AppProvider({ children }) {
 
   const login = async (email, password) => {
     const { token, user } = await api.login(email, password);
-    sessionStorage.setItem('actis_token', token);
+    localStorage.setItem('actis_token', token);
     dispatch({ type: 'SET_AUTH', payload: user });
     const branches = await api.getBranchesTree();
     dispatch({ type: 'INIT_DATA', payload: branches });

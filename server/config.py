@@ -17,6 +17,13 @@ class Settings:
     ).split(",")
     JWT_ALGORITHM: str = "HS256"
     JWT_EXPIRE_MINUTES: int = 480  # 8 hours
+    # Auth session cookie: an httpOnly cookie mirrors the JWT so any same-origin tab (e.g. a preview
+    # popup opened via window.open) is authenticated without the per-tab sessionStorage token. The
+    # Bearer header still works (fallback for cross-origin dev). Set AUTH_COOKIE_SECURE=true in prod
+    # (HTTPS); leave false for local http. SameSite=lax is fine since admin + preview are same-origin.
+    AUTH_COOKIE_NAME: str = "actis_session"
+    AUTH_COOKIE_SECURE: bool = os.getenv("AUTH_COOKIE_SECURE", "false").lower() in ("1", "true", "yes")
+    AUTH_COOKIE_SAMESITE: str = os.getenv("AUTH_COOKIE_SAMESITE", "lax")
     MAX_IMAGE_SIZE: int = 5 * 1024 * 1024  # 5MB
     ALLOWED_IMAGE_TYPES: set = {"image/jpeg", "image/png", "image/webp"}
     ALLOWED_MEDIA_TYPES: set = {"image/jpeg", "image/png", "image/webp", "video/mp4", "video/webm"}

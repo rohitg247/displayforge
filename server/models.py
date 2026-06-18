@@ -119,6 +119,7 @@ class AmbientMediaOut(BaseModel):
     sort_order: int
     status: str = "draft"          # ← add this line
     poster_path: Optional[str] = None   # last-frame JPEG for video->video swap cover
+    thumb_path: Optional[str] = None    # first-frame still for the admin media-list tile (videos)
     duration: Optional[int] = None      # per-image on-screen seconds (NULL = default); ignored for video
 
 

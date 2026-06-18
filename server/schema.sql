@@ -41,6 +41,13 @@ CREATE TABLE IF NOT EXISTS ambient_displays (
     announcement_name     TEXT    DEFAULT '',
     announcement_title    TEXT    DEFAULT '',
     announcement_enabled  INTEGER NOT NULL DEFAULT 0,
+    -- DRAFT (working) copy of display config. Admin/preview reads these; live reads the columns above.
+    -- Publish copies draft_* -> live. Seeded = live values on migration so existing displays are unchanged.
+    draft_orientation           TEXT    DEFAULT NULL,
+    draft_announcement_label    TEXT    DEFAULT NULL,
+    draft_announcement_name     TEXT    DEFAULT NULL,
+    draft_announcement_title    TEXT    DEFAULT NULL,
+    draft_announcement_enabled  INTEGER DEFAULT NULL,
     playlist_video_path   TEXT    DEFAULT NULL,
     playlist_video_sig    TEXT    DEFAULT NULL,
     created_at            TEXT    NOT NULL DEFAULT (datetime('now'))
@@ -52,9 +59,12 @@ CREATE TABLE IF NOT EXISTS ambient_media (
     file_path           TEXT    NOT NULL,
     media_type          TEXT    NOT NULL,
     playlist            TEXT    NOT NULL DEFAULT 'A',
-    sort_order          INTEGER NOT NULL DEFAULT 0,
+    sort_order          INTEGER NOT NULL DEFAULT 0,   -- WORKING (draft) order shown in admin/preview
+    live_sort_order     INTEGER DEFAULT NULL,         -- PUBLISHED order the live viewer uses (set on publish)
+    draft_removed       INTEGER NOT NULL DEFAULT 0,   -- 1 = deleted in working copy, still live until publish
     status              TEXT    NOT NULL DEFAULT 'draft',
     poster_path         TEXT    DEFAULT NULL,
+    thumb_path          TEXT    DEFAULT NULL,   -- first-frame thumbnail for the admin media list (videos)
     duration            INTEGER DEFAULT NULL,   -- per-image on-screen seconds (NULL = default); ignored for video
     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
 );

@@ -153,6 +153,18 @@ def extract_last_frame(video_path, poster_path, timeout: int = 30) -> bool:
     return False
 
 
+def extract_first_frame(video_path, thumb_path, timeout: int = 30) -> bool:
+    """Write the video's FIRST frame to `thumb_path` (admin media-list thumbnail).
+
+    Unlike the last-frame poster (a black-free freeze-frame cover for the panel), this is just a
+    representative still for the admin grid, so we take the literal opening frame. PNG → lossless,
+    any other extension → near-lossless JPEG. Never raises; returns True only on a non-empty file."""
+    video_path = Path(video_path)
+    if not video_path.exists() or not ffmpeg_available():
+        return False
+    return _extract_frame(video_path, Path(thumb_path), ["-ss", "00:00:00"], timeout)
+
+
 def _moov_at_front(path: Path) -> bool:
     """True if the MP4 `moov` atom precedes `mdat` (the file is already `+faststart`).
 

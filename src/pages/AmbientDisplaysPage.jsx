@@ -9,7 +9,9 @@ import { ActisModal } from '@/components/admin/ActisModal';
 import { motion, AnimatePresence } from 'framer-motion';
 import { toast } from '@/components/ui/sonner';
 
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
+// Empty fallback = relative URLs (proxied to the backend by vite dev/preview), so admin thumbnails
+// load even when VITE_API_URL is unset. (The old ':8000' fallback was wrong — the backend is :8888.)
+const API_BASE = import.meta.env.VITE_API_URL || '';
 
 export function AmbientDisplaysPage() {
   const { state } = useApp();
@@ -29,6 +31,12 @@ export function AmbientDisplaysPage() {
   const [orderDirty, setOrderDirty] = useState(false);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState('A');
+  // Publish state for the open playlist (from the GET): is this playlist live, and would publishing change anything.
+  const [playlistMeta, setPlaylistMeta] = useState({ is_live: true, has_unpublished_changes: false });
+  const [publishing, setPublishing] = useState(false);
+  // Hover-to-preview: { item, x, y } while a media tile has been hovered for >2s; null otherwise.
+  const [hoverPreview, setHoverPreview] = useState(null);
+  const hoverTimerRef = useRef(null);
   const fileInputRef = useRef(null);
 
   const fetchDisplays = useCallback(async () => {
@@ -50,6 +58,10 @@ export function AmbientDisplaysPage() {
     try {
       const data = await api.getAmbientDisplay(displayId, playlist, true);
       setMediaItems(data.media || []);
+      setPlaylistMeta({
+        is_live: data.is_live ?? (data.active_playlist === playlist),
+        has_unpublished_changes: data.has_unpublished_changes ?? false,
+      });
     } catch (err) {
       console.error(err);
     }
@@ -121,15 +133,21 @@ export function AmbientDisplaysPage() {
 
   // ✅ CHANGE 2: replaced handleSetLive with handlePublishAndSetLive
   const handlePublishAndSetLive = async (displayId) => {
+    setPublishing(true);
     try {
       await api.publishPlaylist(displayId, activeTab);
-      toast.success(`Playlist ${activeTab} published`);
+      toast.success(`Playlist ${activeTab} is now live — changes blend in at the next item`);
       await fetchDisplays();
-      fetchMedia(displayId, activeTab);
+      await fetchMedia(displayId, activeTab);
     } catch (err) { toast.error(err.message); }
+    finally { setPublishing(false); }
   };
 
-  const handleDragStart = (idx) => setDragIdx(idx);
+  const handleDragStart = (idx) => {
+    if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
+    setHoverPreview(null);
+    setDragIdx(idx);
+  };
   const handleDragOver = (e, idx) => {
     e.preventDefault();
     if (dragIdx === null || dragIdx === idx) return;
@@ -142,11 +160,25 @@ export function AmbientDisplaysPage() {
   };
   const handleDragEnd = () => setDragIdx(null);
 
+  // Hover-to-preview: after the cursor rests on a tile for 2s, show an enlarged preview anchored to it.
+  // Moving the cursor out (or starting a drag) cancels the timer and closes the preview.
+  const handleTileEnter = (e, item) => {
+    const rect = e.currentTarget.getBoundingClientRect();
+    if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current);
+    hoverTimerRef.current = setTimeout(() => setHoverPreview({ item, rect }), 2000);
+  };
+  const handleTileLeave = () => {
+    if (hoverTimerRef.current) { clearTimeout(hoverTimerRef.current); hoverTimerRef.current = null; }
+    setHoverPreview(null);
+  };
+  useEffect(() => () => { if (hoverTimerRef.current) clearTimeout(hoverTimerRef.current); }, []);
+
   const handleSaveOrder = async () => {
     try {
       await api.reorderAmbientMedia(expandedId, mediaItems.map((m) => m.id));
       setOrderDirty(false);
-      toast.success('Order saved');
+      toast.success('Order saved as draft — Publish to push it live');
+      await fetchMedia(expandedId, activeTab);  // refresh the "unpublished changes" state
     } catch (err) { toast.error(err.message); }
   };
 
@@ -256,7 +288,9 @@ export function AmbientDisplaysPage() {
                               {display.media_count} media
                             </span>
                             {!!display.announcement_enabled && (
-                              <Megaphone size={12} className="text-accent" />
+                              <span title="Announcement bar enabled" className="inline-flex">
+                                <Megaphone size={12} className="text-accent" />
+                              </span>
                             )}
                           </div>
                         </div>
@@ -310,21 +344,39 @@ export function AmbientDisplaysPage() {
                                   Playlist {tab}
                                 </button>
                               ))}
-                              {/* ✅ CHANGE 2: Publish & Set Live replaces Set Live */}
-                              {display.active_playlist !== activeTab && (
-                                <ActisButton
-                                  variant="outline"
-                                  size="sm"
-                                  onClick={() => handlePublishAndSetLive(display.id)}
-                                  className="ml-2"
-                                >
-                                  <Radio size={14} /> Publish {activeTab} Live
-                                </ActisButton>
-                              )}
-                              {display.active_playlist === activeTab && (
-                                <span className="ml-2 text-xs px-2 py-1 rounded-full bg-accent/20 text-accent font-medium">
-                                  ● LIVE
-                                </span>
+                              {/* Publish state for the open playlist. Always available so edits to the
+                                  LIVE playlist (add/delete/reorder/announcement/orientation) can be
+                                  pushed live — they stay staged (visible on Preview) until then. */}
+                              {expandedId === display.id && (
+                                !playlistMeta.is_live ? (
+                                  <ActisButton
+                                    variant="primary"
+                                    size="sm"
+                                    disabled={publishing}
+                                    onClick={() => handlePublishAndSetLive(display.id)}
+                                    className="ml-2"
+                                  >
+                                    <Radio size={14} /> {publishing ? 'Publishing…' : `Publish ${activeTab} Live`}
+                                  </ActisButton>
+                                ) : playlistMeta.has_unpublished_changes ? (
+                                  <>
+                                    <span className="ml-2 text-xs px-2 py-1 rounded-full bg-accent/20 text-accent font-medium">
+                                      ● LIVE
+                                    </span>
+                                    <ActisButton
+                                      variant="primary"
+                                      size="sm"
+                                      disabled={publishing}
+                                      onClick={() => handlePublishAndSetLive(display.id)}
+                                    >
+                                      <Radio size={14} /> {publishing ? 'Publishing…' : 'Publish changes'}
+                                    </ActisButton>
+                                  </>
+                                ) : (
+                                  <span className="ml-2 text-xs px-2 py-1 rounded-full bg-accent/20 text-accent font-medium">
+                                    ● LIVE — up to date
+                                  </span>
+                                )
                               )}
                             </div>
                             <div className="flex items-center gap-2">
@@ -357,14 +409,23 @@ export function AmbientDisplaysPage() {
                           {mediaItems.length === 0 ? (
                             <p className="text-muted-foreground text-sm">No media in Playlist {activeTab}.</p>
                           ) : (
-                            <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-3">
-                              {mediaItems.map((item, idx) => (
+                            // Tile aspect tracks the display orientation so the admin preview matches the
+                            // real screen: portrait displays get tall 9:16 tiles, landscape gets 16:9.
+                            <div className={`grid gap-3 ${display.orientation === 'portrait' ? 'grid-cols-3 sm:grid-cols-4 md:grid-cols-6' : 'grid-cols-2 sm:grid-cols-3 md:grid-cols-4'}`}>
+                              {mediaItems.map((item, idx) => {
+                                const mediaH = display.orientation === 'portrait' ? 'aspect-[9/16]' : 'aspect-video';
+                                const thumbSrc = item.media_type === 'image'
+                                  ? `${API_BASE}${item.file_path}`
+                                  : (item.thumb_path ? `${API_BASE}${item.thumb_path}` : null);
+                                return (
                                 <div
                                   key={item.id}
                                   draggable
                                   onDragStart={() => handleDragStart(idx)}
                                   onDragOver={(e) => handleDragOver(e, idx)}
                                   onDragEnd={handleDragEnd}
+                                  onMouseEnter={(e) => handleTileEnter(e, item)}
+                                  onMouseLeave={handleTileLeave}
                                   className={`relative group rounded-lg border border-border overflow-hidden bg-secondary/50 cursor-grab ${
                                     dragIdx === idx ? 'opacity-50 ring-2 ring-primary' : ''
                                   }`}
@@ -379,21 +440,17 @@ export function AmbientDisplaysPage() {
                                     <X size={12} />
                                   </button>
 
-                                  {/* ✅ CHANGE 3: DRAFT badge */}
+                                  {/* DRAFT badge — only unpublished items (status==='draft') carry it. */}
                                   {item.status === 'draft' && (
                                     <span className="absolute bottom-8 left-1 text-[9px] px-1.5 py-0.5 rounded bg-yellow-500/80 text-black font-bold z-10">
                                       DRAFT
                                     </span>
                                   )}
 
-                                  {item.media_type === 'image' ? (
-                                    <img
-                                      src={`${API_BASE}${item.file_path}`}
-                                      alt=""
-                                      className="w-full h-28 object-cover"
-                                    />
+                                  {thumbSrc ? (
+                                    <img src={thumbSrc} alt="" className={`w-full ${mediaH} object-cover`} />
                                   ) : (
-                                    <div className="w-full h-28 flex items-center justify-center bg-secondary">
+                                    <div className={`w-full ${mediaH} flex items-center justify-center bg-secondary`}>
                                       <Film size={24} className="text-muted-foreground" />
                                     </div>
                                   )}
@@ -408,7 +465,8 @@ export function AmbientDisplaysPage() {
                                     </span>
                                   </div>
                                 </div>
-                              ))}
+                                );
+                              })}
                             </div>
                           )}
                         </div>
@@ -532,6 +590,36 @@ export function AmbientDisplaysPage() {
           </div>
         </div>
       </ActisModal>
+
+      {/* Hover-to-preview modal: a larger view of the media after a 2s hover. Closes on mouse-out
+          (the tile's onMouseLeave clears it). pointer-events-none so it never steals the hover. */}
+      {hoverPreview && (
+        <div className="fixed inset-0 z-[200] flex items-center justify-center bg-black/70 pointer-events-none p-6">
+          <div className="relative rounded-xl overflow-hidden border border-border bg-card shadow-2xl"
+               style={{ maxWidth: '80vw', maxHeight: '85vh' }}>
+            {hoverPreview.item.media_type === 'image' ? (
+              <img
+                src={`${API_BASE}${hoverPreview.item.file_path}`}
+                alt=""
+                style={{ maxWidth: '80vw', maxHeight: '85vh', objectFit: 'contain', display: 'block' }}
+              />
+            ) : (
+              <video
+                src={`${API_BASE}${hoverPreview.item.file_path}`}
+                poster={hoverPreview.item.thumb_path ? `${API_BASE}${hoverPreview.item.thumb_path}` : undefined}
+                muted
+                autoPlay
+                loop
+                playsInline
+                style={{ maxWidth: '80vw', maxHeight: '85vh', objectFit: 'contain', display: 'block' }}
+              />
+            )}
+            <div className="px-3 py-1.5 text-xs text-muted-foreground bg-card border-t border-border truncate">
+              {hoverPreview.item.file_path.split('/').pop()}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

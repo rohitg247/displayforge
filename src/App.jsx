@@ -14,6 +14,7 @@ import { DisplayViewerPage } from "./pages/DisplayViewerPage";
 import { BranchesPage } from "./pages/BranchesPage";
 import { AmbientDisplaysPage } from "./pages/AmbientDisplaysPage";
 import { AmbientViewerPage } from "./pages/AmbientViewerPage";
+import AmbientOrientationGate from "./components/AmbientOrientationGate";
 import { AmbientDebugLogPage } from "./pages/AmbientDebugLogPage";
 import NotFound from "./pages/NotFound";
 
@@ -30,7 +31,14 @@ const App = () => (
             <Route path="/" element={<Navigate to="/admin/login" replace />} />
             <Route path="/admin/login" element={<LoginPage />} />
             <Route path="/:branchId/1/:id" element={<DisplayViewerPage />} />
-            <Route path="/:branchId/2/:id" element={<AmbientViewerPage />} />
+            <Route
+              path="/:branchId/2/:id"
+              element={
+                <AmbientOrientationGate>
+                  <AmbientViewerPage />
+                </AmbientOrientationGate>
+              }
+            />
             <Route path="/:branchId/2/:id/debug-log/latest" element={<AmbientDebugLogPage />} />
             <Route
               path="/admin"

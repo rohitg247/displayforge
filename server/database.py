@@ -35,11 +35,35 @@ def init_db():
         "ALTER TABLE ambient_media ADD COLUMN duration INTEGER DEFAULT NULL",
         "ALTER TABLE ambient_displays ADD COLUMN playlist_video_path TEXT DEFAULT NULL",
         "ALTER TABLE ambient_displays ADD COLUMN playlist_video_sig TEXT DEFAULT NULL",
+        # Draft-staging publish workflow: working copies of display config + media order/removal.
+        "ALTER TABLE ambient_displays ADD COLUMN draft_orientation TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN draft_announcement_label TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN draft_announcement_name TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN draft_announcement_title TEXT DEFAULT NULL",
+        "ALTER TABLE ambient_displays ADD COLUMN draft_announcement_enabled INTEGER DEFAULT NULL",
+        "ALTER TABLE ambient_media ADD COLUMN live_sort_order INTEGER DEFAULT NULL",
+        "ALTER TABLE ambient_media ADD COLUMN draft_removed INTEGER NOT NULL DEFAULT 0",
+        "ALTER TABLE ambient_media ADD COLUMN thumb_path TEXT DEFAULT NULL",
     ):
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
             pass  # column already exists
+
+    # Seed the new draft/published columns so existing displays behave exactly as before until edited:
+    #   draft_* := current live values (admin/preview shows the live config until a draft edit is made)
+    #   live_sort_order := sort_order for already-live media (so the published order is unchanged)
+    conn.execute(
+        """UPDATE ambient_displays SET
+               draft_orientation          = COALESCE(draft_orientation, orientation),
+               draft_announcement_label   = COALESCE(draft_announcement_label, announcement_label),
+               draft_announcement_name    = COALESCE(draft_announcement_name, announcement_name),
+               draft_announcement_title   = COALESCE(draft_announcement_title, announcement_title),
+               draft_announcement_enabled = COALESCE(draft_announcement_enabled, announcement_enabled)"""
+    )
+    conn.execute(
+        "UPDATE ambient_media SET live_sort_order = sort_order WHERE live_sort_order IS NULL AND status = 'live'"
+    )
 
     conn.commit()
     conn.close()

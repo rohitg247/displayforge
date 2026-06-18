@@ -26,7 +26,7 @@ import sqlite3
 from pathlib import Path
 
 from .config import settings
-from .media_utils import extract_last_frame, normalize_video, ffmpeg_available
+from .media_utils import extract_last_frame, extract_first_frame, normalize_video, ffmpeg_available
 
 
 def _backfill_posters(conn, upload_dir) -> None:
@@ -139,6 +139,39 @@ def _normalize_existing(conn, upload_dir) -> None:
     )
 
 
+def _backfill_thumbs(conn, upload_dir) -> None:
+    """Ensure every video row has a first-frame thumbnail for the admin media list. Additive, idempotent."""
+    rows = conn.execute(
+        "SELECT id, file_path, thumb_path FROM ambient_media WHERE media_type = 'video'"
+    ).fetchall()
+
+    generated = linked = skipped = failed = 0
+    for r in rows:
+        if r["thumb_path"]:
+            skipped += 1
+            continue
+        video_disk = upload_dir / Path(r["file_path"]).name
+        thumb_name = f"{video_disk.stem}-thumb.jpg"
+        thumb_disk = upload_dir / thumb_name
+        thumb_url = f"/uploads/{thumb_name}"
+        if thumb_disk.exists() and thumb_disk.stat().st_size > 0:
+            conn.execute("UPDATE ambient_media SET thumb_path = ? WHERE id = ?", (thumb_url, r["id"]))
+            conn.commit()
+            linked += 1
+            print(f"linked existing thumb   media {r['id']:>4} -> {thumb_url}")
+            continue
+        if extract_first_frame(video_disk, thumb_disk):
+            conn.execute("UPDATE ambient_media SET thumb_path = ? WHERE id = ?", (thumb_url, r["id"]))
+            conn.commit()
+            generated += 1
+            print(f"generated thumb         media {r['id']:>4} -> {thumb_url}")
+        else:
+            failed += 1
+            print(f"FAILED thumb (missing file/decode)  media {r['id']:>4} ({r['file_path']})")
+
+    print(f"Thumbs: generated={generated} linked={linked} skipped(already set)={skipped} failed={failed}")
+
+
 def _backfill_playlist_videos(conn, upload_dir) -> None:
     """Build the LOSSLESS joined clips (per-item video-run clips + the all-video MSE loop clip) for every
     display's live playlist, idempotently — so EXISTING displays get them without re-publishing from the
@@ -173,6 +206,12 @@ def main() -> None:
         help="Also build the lossless joined clips (adjacent video-run clips + the all-video MSE loop) "
              "for each display's live playlist. Safe/idempotent. Default: off.",
     )
+    parser.add_argument(
+        "--thumbs",
+        action="store_true",
+        help="Also generate first-frame thumbnails for existing videos (admin media list). "
+             "Safe/idempotent. Default: off.",
+    )
     args = parser.parse_args()
 
     if not ffmpeg_available():
@@ -188,6 +227,8 @@ def main() -> None:
     if args.normalize:
         _normalize_existing(conn, upload_dir)
     _backfill_posters(conn, upload_dir)
+    if args.thumbs:
+        _backfill_thumbs(conn, upload_dir)
     if args.playlist_videos:
         _backfill_playlist_videos(conn, upload_dir)
 
