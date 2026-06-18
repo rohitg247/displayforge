@@ -335,6 +335,15 @@ def get_ambient_display(
     if not disp:
         raise HTTPException(status_code=404, detail="Ambient display not found")
 
+    # The live viewer never sends a playlist (it doesn't know the active one until this response
+    # comes back), but it must only ever see ONE playlist's media — otherwise _is_video_group/_run_sig/
+    # _collapse_runs_for_view below run on a cross-playlist-merged row set, which can mis-signature the
+    # run/loop clips built by _regenerate_playlist_video (always single-playlist-scoped) and misgroup
+    # adjacent-video runs across playlists. Resolve to the published active playlist up front so the
+    # rest of this function only ever operates on one playlist's rows, matching publish-time scoping.
+    if not admin and playlist not in ("A", "B"):
+        playlist = disp["active_playlist"] or "A"
+
     # Draft-staging: the admin/preview ("working") view shows everything not pending-removal, in the
     # working order (sort_order). The live (published) view shows only status='live' media in the
     # PUBLISHED order (live_sort_order) — staged reorders/adds/deletes don't reach it until Publish.

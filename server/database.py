@@ -4,7 +4,11 @@ from .config import settings
 
 
 def get_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(settings.DATABASE_PATH)
+    # check_same_thread=False: FastAPI dispatches a sync `yield` dependency's setup and teardown as two
+    # separate threadpool calls, which can land on different OS threads — sqlite3's default same-thread
+    # check then raises mid-request. Safe here because each request gets its own private connection
+    # (opened and closed within db_dependency below), never shared across requests/threads concurrently.
+    conn = sqlite3.connect(settings.DATABASE_PATH, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")

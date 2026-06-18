@@ -299,16 +299,18 @@ export function AmbientDisplaysPage() {
                         <ActisButton
                           variant="outline"
                           size="sm"
+                          title="Shows your unpublished changes — won't affect the live screen until you Publish"
                           onClick={() => window.open(`/${display.branch_id}/2/${display.id}?preview=true&playlist=${activeTab}`, '_blank')}
                         >
-                          <Eye size={14} /> Preview
+                          <Eye size={14} /> Preview (draft)
                         </ActisButton>
                         <ActisButton
                           variant="outline"
                           size="sm"
+                          title="Shows only what's currently published/live"
                           onClick={() => window.open(`/${display.branch_id}/2/${display.id}`, '_blank')}
                         >
-                          <Tv2 size={14} /> View
+                          <Tv2 size={14} /> View Live
                         </ActisButton>
                         <ActisButton variant="outline" size="sm" onClick={() => openEdit(display)}>
                           <Edit2 size={14} /> Edit

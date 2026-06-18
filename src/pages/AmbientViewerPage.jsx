@@ -1394,10 +1394,14 @@ export function AmbientViewerPage() {
     try {
       await api.publishPlaylist(Number(id), previewPlaylist);
       toast.success(`Playlist ${previewPlaylist} is now live!`);
-      window.close();
+      // Give the user a moment to actually see the success toast land before the tab vanishes —
+      // closing instantly made a successful publish look identical to a silently-failed one.
+      setTimeout(() => window.close(), 900);
     } catch (err) {
-      toast.error(err.message);
-    } finally {
+      const msg = err.message === 'Not authenticated' || err.message === 'Token expired'
+        ? 'Session expired — please reopen this preview from the admin panel and try again.'
+        : err.message;
+      toast.error(msg);
       setPublishing(false);
     }
   }, [id, previewPlaylist]);

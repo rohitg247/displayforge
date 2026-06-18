@@ -1,4 +1,4 @@
-const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8888';
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8000';
 
 function getToken() {
   // localStorage (shared across same-origin tabs) so a preview popup inherits the token; the httpOnly
@@ -17,9 +17,17 @@ async function request(path, options = {}) {
   const res = await fetch(`${API_BASE}${path}`, { ...options, headers, credentials: 'include' });
 
   if (res.status === 401) {
+    let detail = 'Unauthorized';
+    try {
+      const body = await res.json();
+      detail = body.detail || detail;
+    } catch {
+      // Response wasn't JSON
+    }
+    console.error('[auth] 401 on', options.method || 'GET', path, '-', detail);
     localStorage.removeItem('actis_token');
     window.location.href = '/admin/login';
-    throw new Error('Unauthorized');
+    throw new Error(detail);
   }
 
   if (!res.ok) {
