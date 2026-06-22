@@ -1878,3 +1878,71 @@ Announcement overlay `bottom` offset updated to `colorBarHeight` to stay above t
 ### 7. `src/pages/AmbientViewerPage_New_Ver.jsx` — Deleted
 
 Reference implementation file removed after merge into `AmbientViewerPage.jsx`.
+
+---
+
+## 2026-06-22 — Images render at true brightness on Tizen + announcement bar size restored
+
+**File:** `src/pages/AmbientViewerPage.jsx` (engine bumped `3.1-loop-hardened` → `3.2-img-truecolor`)
+
+### Problem fixed
+On the real Samsung Tizen panel, **images displayed persistently darker than video**. A video played
+at correct brightness; the moment it transitioned to an image, the image stayed visibly darker for
+its entire ~5s display, every cycle. It was **not** a flash/timing artifact (constant for the whole
+duration) and did **not** reproduce on a laptop/desktop browser.
+
+### Root cause
+The two content `<img>` layers and the poster `<img>` carried `willChange: 'opacity'` (via the shared
+`layerStyle()` helper). `will-change` **permanently promotes** an element onto its own GPU compositing
+layer. On Tizen's embedded Chromium that promoted layer is composited **without colour management**, so
+it renders darker/colour-shifted than the main backing surface. The live `<video>` is on a separate
+hardware plane (unaffected), and desktop Chromium colour-manages composited layers correctly — which is
+exactly why video stayed bright and the laptop never reproduced it. The darkness was *persistent*
+because the image stayed permanently promoted for its whole display. (Predicted in this log on
+2026-06-17: residual darkness would be "Tizen's native color-space handling or graphics-vs-video-plane
+compositing math.")
+
+### Fix
+- **Dropped `willChange: 'opacity'` from `layerStyle()`** (kept as a dated comment, not deleted). This
+  affects only the graphics-plane `<img>` layers (imageA/imageB + poster). The `<video>` and canvas
+  bridge keep their own `willChange` (separate inline styles) — **video transitions are unchanged**.
+  Without the permanent hint, an opacity crossfade still auto-promotes the layer *for the duration of
+  the fade* and then de-promotes it back to the main surface, so the image paints at its **true
+  brightness** for its full display. Deterministic, no per-panel tuning, works on all playlists / all
+  Samsung panels.
+- **Poster note:** the poster shares `layerStyle`, so it loses `willChange` too. This is intentional —
+  the poster only does instant hard cuts (where `will-change` does nothing), and keeping it promoted
+  (dark) while the image renders bright would introduce a brightness *pop* at the `video→image` reveal.
+  Removing it from both keeps the hard-cut brightness-consistent.
+
+### Diagnostic added (debug-only, zero production cost)
+On engine init under `?debug=true`, logs `img-layer willChange=<computed> (expect 'auto')` so the
+running build can be confirmed live from the debug-log stream (`/api/ambient/<id>/debug-log/latest`).
+**Caveat:** the darkness is a *composited-output* artifact — `getImageData` reads the always-bright
+*source* pixels, so no log can measure it; a photo of the panel remains the real brightness check.
+
+### Confidence / contingency
+High but not certain (~80–85%) since a compositing colour artifact can only be confirmed on-device.
+If darkness persists after this, the next suspect (specific to the `video→image` path) is the hidden
+`<video>` plane still influencing the graphics plane — follow-up would hard-unload/detach the video
+element while an image is shown.
+
+### Also: announcement bar size reverted
+The announcement text box (reduced 2026-06-17) was restored to its original larger sizes; the reduced
+values are kept as dated comments beside each active value:
+
+| Element | Property | Reduced (now commented) | Restored (active) |
+|---|---|---|---|
+| Box container | `padding` | `clamp(3px, 0.5vh, 8px) 0` | `clamp(6px, 1vh, 14px) 0` |
+| Label | `fontSize` | `clamp(7px, 0.8vw, 10px)` | `clamp(9px, 1.1vw, 14px)` |
+| Label | `marginBottom` | `2` | `4` |
+| Name | `fontSize` | `clamp(9px, 1.2vw, 16px)` | `clamp(13px, 1.8vw, 24px)` |
+| Name | `marginBottom` | `1` | `2` |
+| Title | `fontSize` | `clamp(8px, 0.9vw, 13px)` | `clamp(11px, 1.3vw, 18px)` |
+
+The bottom scrolling colour band (`colorBarHeight`) was already at its larger values and is unchanged.
+
+### Not touched
+All transition functions (`runVideoToVideo` / `runVideoToImage` / `runImageToImage` /
+`runImageToVideo`), the swap-timeout / first-frame-loop logic, the seamless-loop and MSE-loop engines,
+z-indices, opacity durations/easings, and the backend/ffmpeg media pipeline.

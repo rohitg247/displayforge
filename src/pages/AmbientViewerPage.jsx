@@ -60,7 +60,7 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '3.1-loop-hardened';
+const ENGINE_VERSION = '3.2-img-truecolor';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
 
 // Both the Samsung panel and a regular browser (laptop/desktop) can open ?debug=true and stream to the
@@ -960,12 +960,22 @@ export function AmbientViewerPage() {
     if (!display || media.length === 0) return;
     if (!videoRef.current || !imageARef.current || !imageBRef.current || !bridgeCanvasRef.current) return;
     logEvent('state', `engine ${ENGINE_VERSION} · build ${BUILD_STAMP}`);
+    // Confirm the image-brightness fix actually shipped to this panel: the <img> layers must no longer
+    // be permanently will-change-promoted (expect 'auto'; 'opacity' means an old build is still live).
+    // This is the only thing we CAN verify from logs — the darkness itself is a composited-output
+    // artifact, invisible to getImageData (which reads the always-bright source pixels), so the real
+    // brightness check is still a photo of the panel.
+    if (isDebug && imageARef.current) {
+      try {
+        logEvent('state', `img-layer willChange=${getComputedStyle(imageARef.current).willChange} (expect 'auto')`);
+      } catch (_) { /* ignore */ }
+    }
     logEvent('lifecycle', 'mount [video]');
     logEvent('lifecycle', 'mount [img-A]');
     logEvent('lifecycle', 'mount [img-B]');
     logEvent('lifecycle', 'mount [bridge]');
     start(media[0]);
-  }, [display, media, start, logEvent, singleVideoMode, mseMode]);
+  }, [display, media, start, logEvent, singleVideoMode, mseMode, isDebug]);
 
   /* --------------------- SEAMLESS-LOOP MODE (single file) ------------------- */
 
@@ -1461,7 +1471,13 @@ export function AmbientViewerPage() {
     opacity: 0,
     transition: 'none',
     zIndex: z,
-    willChange: 'opacity',
+    // willChange: 'opacity',  // REMOVED 2026-06-22 — on the Samsung Tizen panel a permanently
+    // will-change-promoted <img> layer is composited on a separate GPU layer WITHOUT colour
+    // management, so it renders persistently darker than the live <video> (laptop/desktop Chromium is
+    // unaffected — it colour-manages composited layers). Dropping the hint lets the image paint on the
+    // main backing surface at its true brightness; an opacity crossfade still auto-promotes the layer
+    // for the duration of the fade, then de-promotes it back. Re-enable ONLY if a crossfade visibly
+    // regresses on-device. Note: <video> + canvas keep their own willChange (separate inline styles).
     pointerEvents: 'none',
   });
 
@@ -1714,26 +1730,26 @@ export function AmbientViewerPage() {
               style={{
                 background: 'rgba(5, 30, 50, 0.9)',
                 borderRadius: '15px 15px 0 0',
-                // padding: 'clamp(4px, 0.6vh, 8px) 0',
-                // padding: 'clamp(6px, 1vh, 14px) 0',
-                padding: 'clamp(3px, 0.5vh, 8px) 0',
+                // padding: 'clamp(4px, 0.6vh, 8px) 0',                  // older
+                // padding: 'clamp(3px, 0.5vh, 8px) 0',  // reduced 2026-06-17, reverted 2026-06-22
+                padding: 'clamp(6px, 1vh, 14px) 0',                     // active (original size)
                 textAlign: 'center',
                 color: '#ffffff',
               }}
             >
-              {/* <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}> */}
-              <div style={{ fontSize: 'clamp(7px, 0.8vw, 10px)', fontWeight: 400, opacity: 0.9, marginBottom: 2 }}>
+              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(7px, 0.8vw, 10px)', fontWeight: 400, opacity: 0.9, marginBottom: 2 }}> */}
+              <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}>
                 {announcementLabel}
               </div>
-              {/* backup: <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}> */}
+              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(9px, 1.2vw, 16px)', fontWeight: 700, marginBottom: 1 }}> */}
               {announcementName && (
-                <div style={{ fontSize: 'clamp(9px, 1.2vw, 16px)', fontWeight: 700, marginBottom: 1 }}>
+                <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}>
                   {announcementName}
                 </div>
               )}
-              {/* backup: <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}> */}
+              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(8px, 0.9vw, 13px)', fontWeight: 700 }}> */}
               {announcementTitle && (
-                <div style={{ fontSize: 'clamp(8px, 0.9vw, 13px)', fontWeight: 700 }}>
+                <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}>
                   {announcementTitle}
                 </div>
               )}

@@ -1,8 +1,21 @@
 # Session handoff — Tizen ambient viewer: full-quality hybrid engine (v4) + flash fix
 
 **For:** the next thread / engineer picking this up.
-**Date:** 2026-06-17. **Branch:** `main`.
+**Date:** 2026-06-22 (prev 2026-06-17). **Branch:** `main`.
 **Status:** **STABLE — verified working on the Samsung Tizen panel** (full-quality, black-free).
+
+> **Update 2026-06-22 (engine `3.2-img-truecolor`):**
+> - **Images now render at true brightness on Tizen.** Removed the permanent `willChange: 'opacity'`
+>   from the `<img>` layers (shared `layerStyle()`): on Tizen's embedded Chromium a will-change-promoted
+>   layer is composited without colour management → images looked persistently darker than video (laptop
+>   was fine). `<video>`/canvas keep their own `willChange`; no transition logic changed. The image now
+>   only auto-promotes during the crossfade, then de-promotes → paints at source brightness. **Verify
+>   on-device** (a compositing colour artifact can't be confirmed from logs — only a photo of the panel;
+>   `?debug=true` logs `img-layer willChange=auto` to confirm the build is live). If darkness persists,
+>   next suspect is the hidden `<video>` plane on the `video→image` path (hard-unload the video element).
+> - **Announcement bar size reverted** to its original larger text/padding (reduced values kept as dated
+>   comments). Bottom colour band unchanged.
+> - Full detail in `changes.md` (2026-06-22 entry).
 
 ---
 

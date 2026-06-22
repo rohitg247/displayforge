@@ -114,3 +114,26 @@ Based directly on the findings above:
 with a broken build (Rounds 8–9). Round 10 removes the gap **only for video↔video** (lossless joins +
 MSE) while keeping images out of any video entirely — so it satisfies *both* "no black" and "no quality
 loss" for the first time, with AVPlay as the documented guarantee for the residual browser-only risk.
+
+---
+
+### Addendum — Image brightness on Tizen (`will-change` layer promotion) · 2026-06-22 · `3.2-img-truecolor`
+
+Separate from the black-gap saga (a *colour* artifact, not a *timing* one). After Round 10 was stable,
+images displayed **persistently darker than video** on the Tizen panel — constant for the whole ~5s
+display, every cycle, laptop-clean.
+
+- **Cause:** the `<img>` layers (+ poster) carried `willChange: 'opacity'`, which **permanently promotes**
+  the element to its own GPU compositing layer. Tizen's embedded Chromium composites that promoted layer
+  **without colour management** → renders darker than the main surface. The live `<video>` is on a
+  separate HW plane (bright); desktop Chromium colour-manages composited layers (laptop fine). This is the
+  concrete mechanism behind the 2026-06-17 prediction ("Tizen native colour-space / graphics-vs-video-
+  plane compositing math").
+- **Fix:** removed `willChange` from the shared `layerStyle()` (kept commented). Image now auto-promotes
+  only *during* the opacity crossfade, then de-promotes back to the main surface → paints at true source
+  brightness. `<video>`/canvas keep their own `willChange`; **no transition logic changed**.
+- **Why it can't be measured in logs:** brightness is a *composited-output* artifact; `getImageData`
+  reads the always-bright *source* pixels, so the only proof is a photo of the panel. `?debug=true` logs
+  `img-layer willChange=auto` purely to confirm the build is live.
+- **Contingency if it persists:** next suspect is the hidden `<video>` plane still tinting the graphics
+  plane on the `video→image` path → hard-unload/detach the `<video>` element while an image is shown.
