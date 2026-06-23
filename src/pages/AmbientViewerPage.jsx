@@ -60,7 +60,7 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '3.3r-reverted';
+const ENGINE_VERSION = '3.1-loop-hardened';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
 
 // Both the Samsung panel and a regular browser (laptop/desktop) can open ?debug=true and stream to the
@@ -1461,8 +1461,7 @@ export function AmbientViewerPage() {
     opacity: 0,
     transition: 'none',
     zIndex: z,
-    willChange: 'opacity',  // smooths the opacity crossfades. (Removing it — the 3.2 image-darkness
-    // theory — was DISPROVEN on-device, so it stays. The image/video brightness difference is unrelated.)
+    willChange: 'opacity',
     pointerEvents: 'none',
   });
 
@@ -1715,24 +1714,24 @@ export function AmbientViewerPage() {
               style={{
                 background: 'rgba(5, 30, 50, 0.9)',
                 borderRadius: '15px 15px 0 0',
-                // padding: 'clamp(4px, 0.6vh, 8px) 0',                  // older
-                // padding: 'clamp(3px, 0.5vh, 8px) 0',  // reduced 2026-06-17, reverted 2026-06-22
-                padding: 'clamp(6px, 1vh, 14px) 0',                     // active (original size)
+                // padding: 'clamp(4px, 0.6vh, 8px) 0',
+                // padding: 'clamp(3px, 0.5vh, 8px) 0',   // reduced — reverted to larger size
+                padding: 'clamp(6px, 1vh, 14px) 0',
                 textAlign: 'center',
                 color: '#ffffff',
               }}
             >
-              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(7px, 0.8vw, 10px)', fontWeight: 400, opacity: 0.9, marginBottom: 2 }}> */}
+              {/* reduced: <div style={{ fontSize: 'clamp(7px, 0.8vw, 10px)', fontWeight: 400, opacity: 0.9, marginBottom: 2 }}> */}
               <div style={{ fontSize: 'clamp(9px, 1.1vw, 14px)', fontWeight: 400, opacity: 0.9, marginBottom: 4 }}>
                 {announcementLabel}
               </div>
-              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(9px, 1.2vw, 16px)', fontWeight: 700, marginBottom: 1 }}> */}
+              {/* reduced: <div style={{ fontSize: 'clamp(9px, 1.2vw, 16px)', fontWeight: 700, marginBottom: 1 }}> */}
               {announcementName && (
                 <div style={{ fontSize: 'clamp(13px, 1.8vw, 24px)', fontWeight: 700, marginBottom: 2 }}>
                   {announcementName}
                 </div>
               )}
-              {/* reduced 2026-06-17, reverted 2026-06-22: <div style={{ fontSize: 'clamp(8px, 0.9vw, 13px)', fontWeight: 700 }}> */}
+              {/* reduced: <div style={{ fontSize: 'clamp(8px, 0.9vw, 13px)', fontWeight: 700 }}> */}
               {announcementTitle && (
                 <div style={{ fontSize: 'clamp(11px, 1.3vw, 18px)', fontWeight: 700 }}>
                   {announcementTitle}
