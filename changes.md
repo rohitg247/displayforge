@@ -1946,3 +1946,55 @@ The bottom scrolling colour band (`colorBarHeight`) was already at its larger va
 All transition functions (`runVideoToVideo` / `runVideoToImage` / `runImageToImage` /
 `runImageToVideo`), the swap-timeout / first-frame-loop logic, the seamless-loop and MSE-loop engines,
 z-indices, opacity durations/easings, and the backend/ffmpeg media pipeline.
+
+---
+
+## 2026-06-23 — Dark images on Tizen: REAL fix (release the HW video plane) — `3.3-img-plane-release`
+
+**File:** `src/pages/AmbientViewerPage.jsx` (engine `3.2-img-truecolor` → `3.3-img-plane-release`).
+
+### Correction to the 2026-06-22 entry
+The `will-change` theory above was **DISPROVEN on-device**: the 3.2 build shipped (`willChange=auto`
+confirmed in the debug-log stream) yet the image was still dark. `will-change` was never the cause —
+the original `willChange: 'opacity'` is restored in `layerStyle()` (it only ever smoothed the
+crossfades).
+
+### How the real cause was found
+- **On-device:** `willChange=auto` still dark → not a layer-promotion issue.
+- **Image files:** `server/uploads/ambient-2-*.png/.jpg` are plain 8-bit sRGB with **no ICC/colour
+  profile** → render identically on Tizen and laptop → the darkness is **not in the image pixels**.
+- **Backend:** images are served as the original `/uploads/<file>` (no re-encode).
+- **Git bisect (decisive):** the dimming appeared exactly at commit **`529a304`** (2026-05-26,
+  "Tizen-hardened single-video + bridge engine") — the moment the renderer switched from v1's
+  **conditional** `{type==='video' ? <video/> : <img/>}` to an **always-mounted `<video>`**. v1
+  (`a2202ed`…`46c1da0`) had no `<video>` in the DOM while an image showed → no dimming, matching the
+  user's recollection that early builds were fine.
+
+### Root cause
+On Samsung Tizen a mounted `<video>` holds the **hardware video plane**; `opacity:0` does **not**
+release it. The active plane (limited-range video plane vs full-range graphics plane) makes the
+graphics-plane `<img>` composited above it render persistently darker. Laptops have no separate video
+plane, so they never reproduced it. Confirmed by vendor/industry docs (Samsung PiP overlay model;
+BrightSign/signage guidance that *invisible video players stay active — clear `src` + `.load()` to
+release hardware*; limited-vs-full RGB-range explainer).
+
+### Fix — release the plane while an image is displayed (mirrors v1, no engine refactor)
+- New `releaseVideoPlane()` = `pause()` + `removeAttribute('src')` + `load()` + `display:none` (frees
+  the Tizen HW plane, the documented signage method); `acquireVideoPlane()` restores it.
+- Wired so the plane is active **only** during video playback/transitions: `start()` (per item type),
+  `runImageToVideo` (acquire before decode), `runVideoToVideo` (acquire, idempotent), `runVideoToImage`
+  (release in the poster-freeze branch so the revealed image is full-bright), and `finalizeSwap`
+  (consolidated end-state: image → release, video → acquire).
+- `handleVideoError` ignores the synthetic error from the deliberate teardown (`releasingPlaneRef`).
+- Black-free preserved: the outgoing image stays as the cover until the re-acquired video presents its
+  first real frame, so the reload latency is masked.
+- Bumped `ENGINE_VERSION`; the plane helpers log `video plane released/acquired` under `?debug`.
+
+### Not touched
+Transition timing/easing, poster + canvas-bridge mechanics, prefetch, the seamless-loop & MSE-loop
+engines (separate elements), and the backend pipeline.
+
+### Also
+- New `docs/ambient-architecture.md` — full subsystem map (modes, per-item engine, backend, data flow).
+- Optional follow-up (deferred): a dip-free image crossfade (fixed BASE/FADE layers, no z-index
+  animation) to remove the slight mid-crossfade luminance dip — not bundled with this critical fix.

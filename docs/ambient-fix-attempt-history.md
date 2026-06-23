@@ -137,3 +137,27 @@ display, every cycle, laptop-clean.
   `img-layer willChange=auto` purely to confirm the build is live.
 - **Contingency if it persists:** next suspect is the hidden `<video>` plane still tinting the graphics
   plane on the `video→image` path → hard-unload/detach the `<video>` element while an image is shown.
+
+---
+
+### Addendum 2 — willChange DISPROVEN; real cause = mounted `<video>` holds the HW plane · 2026-06-23 · `3.3-img-plane-release`
+
+The willChange fix above shipped but **did not work** — the on-device debug log showed `willChange=auto`
+and the image was **still dark**. willChange was never the cause (it's restored).
+
+- **Evidence chain:** (1) on-device `willChange=auto` still dark; (2) the `ambient-2-*` image files are
+  plain 8-bit sRGB with **no ICC/colour profile** → identical on Tizen and laptop → not the pixels;
+  (3) backend serves images unchanged; (4) **git bisect** pinned the regression to commit **`529a304`**
+  (2026-05-26) — exactly when the renderer changed from v1's **conditional** `{video?:<video>:<img>}`
+  to an **always-mounted `<video>`**. Before that (v1 … `46c1da0`) there was no `<video>` in the DOM
+  while an image showed → no dimming, matching "early builds were fine".
+- **Root cause:** on Tizen a mounted `<video>` holds the **hardware video plane**; `opacity:0` does NOT
+  release it, and the active plane dims the graphics-plane `<img>` above it (limited-range video plane
+  vs full-range graphics plane). Corroborated by Samsung's PiP overlay model and BrightSign/signage docs
+  ("invisible video players stay active — clear `src` + `.load()` to release hardware").
+- **Fix (engine 3.3):** `releaseVideoPlane()` (`pause`+`removeAttribute('src')`+`load()`+`display:none`)
+  frees the plane whenever settled on an image; `acquireVideoPlane()` restores it before video plays.
+  Wired into `start` / `finalizeSwap` / `runImageToVideo` / `runVideoToVideo` / `runVideoToImage`. Keeps
+  the single mounted element (no engine refactor), reproduces v1's "no active plane during images", and
+  stays black-free (the outgoing image cover masks the re-acquire). This is the contingency flagged in
+  Addendum 1, now executed and evidence-backed.
