@@ -60,7 +60,7 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '3.3-img-plane-release';
+const ENGINE_VERSION = '3.3r-reverted';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
 
 // Both the Samsung panel and a regular browser (laptop/desktop) can open ?debug=true and stream to the
@@ -112,7 +112,6 @@ export function AmbientViewerPage() {
 
   // DOM refs
   const videoRef = useRef(null);
-  const releasingPlaneRef = useRef(false);  // true while we deliberately tear down the <video> (suppress its emptied/error)
   const imageARef = useRef(null);
   const imageBRef = useRef(null);
   const posterRef = useRef(null);        // server-generated last-frame cover for video->video swaps
@@ -208,35 +207,6 @@ export function AmbientViewerPage() {
       prevNsRef.current = v.networkState;
     }
   }, [logEvent]);
-
-  /* --------------------------- VIDEO PLANE (Tizen) -------------------------- */
-
-  // On Samsung Tizen a mounted <video> holds the hardware VIDEO PLANE; opacity:0 does NOT release it,
-  // and the active plane makes the graphics-plane <img> composited above it render persistently darker
-  // (the limited-range video plane vs full-range graphics plane mismatch). v1 conditionally rendered
-  // the <video>, so while an image showed there was no video element → no active plane → image at true
-  // brightness. We reproduce that here without unmounting: when settled on an image we RELEASE the
-  // plane the way signage engines do (clear src + load() synchronously frees the HW resource —
-  // BrightSign/Tizen docs), and we RE-ACQUIRE it before any video plays. Same-origin, never throws.
-  const releaseVideoPlane = useCallback(() => {
-    const v = videoRef.current;
-    if (!v || v.style.display === 'none') return;  // already released
-    try { v.pause(); } catch (_) { /* ignore */ }
-    releasingPlaneRef.current = true;              // the teardown fires emptied/abort/error — suppress it
-    try { v.removeAttribute('src'); v.load(); } catch (_) { /* ignore */ }  // frees the Tizen HW video plane
-    v.style.display = 'none';                       // Samsung-recommended hide; removes it from compositing
-    if (isDebug) logEvent('state', 'video plane released (image)');
-  }, [isDebug, logEvent]);
-
-  const acquireVideoPlane = useCallback(() => {
-    const v = videoRef.current;
-    if (!v) return;
-    releasingPlaneRef.current = false;
-    if (v.style.display === 'none') {
-      v.style.display = '';
-      if (isDebug) logEvent('state', 'video plane acquired');
-    }
-  }, [isDebug, logEvent]);
 
   /* ----------------------------- BRIDGE HELPERS ----------------------------- */
 
@@ -484,9 +454,6 @@ export function AmbientViewerPage() {
     if (!tokenValid(token)) return;
     currentIdxRef.current = nextIdx;
     currentItemTypeRef.current = nextItem.media_type;
-    // Settled end-state: release the Tizen HW video plane while on an image (un-dims it), keep it
-    // acquired while on a video. Single consolidated point for every transition's outcome.
-    if (currentItemTypeRef.current === 'video') acquireVideoPlane(); else releaseVideoPlane();
     if (swapDeadlineRef.current) { clearTimeout(swapDeadlineRef.current); swapDeadlineRef.current = null; }
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     lastSwapMsRef.current = Math.round(performance.now() - swapStartAtRef.current);
@@ -510,14 +477,13 @@ export function AmbientViewerPage() {
 
     // Decode the now-current video's last-frame poster so the next video->video swap can use it.
     preloadPoster(mediaRef.current[currentIdxRef.current]);
-  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch, preloadPoster, acquireVideoPlane, releaseVideoPlane]);
+  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch, preloadPoster]);
 
   /* ---------------------------- TRANSITION CASES ---------------------------- */
 
   const runVideoToVideo = useCallback((nextItem, nextIdx) => {
     const v = videoRef.current;
     if (!v) return;
-    acquireVideoPlane();  // ensure the video element is live (idempotent — already active in a video run)
     const token = bumpToken();
     swapStartAtRef.current = performance.now();
     goState(STATE_SWAPPING);
@@ -629,7 +595,7 @@ export function AmbientViewerPage() {
       dropCover();
       finalizeSwap(token, nextItem, nextIdx);
     });
-  }, [bumpToken, goState, captureBridge, setBridgeOpacity, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop, acquireVideoPlane]);
+  }, [bumpToken, goState, captureBridge, setBridgeOpacity, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop]);
 
   const runImageToImage = useCallback((nextItem, nextIdx) => {
     const fromKey = activeImageRef.current;
@@ -740,9 +706,6 @@ export function AmbientViewerPage() {
       v.style.transition = 'none';
       v.style.opacity = '0';
       try { v.pause(); logEvent('lifecycle', 'video frozen to poster + paused'); } catch (_) {}
-      // The poster <img> now covers the video, so release the Tizen video plane immediately — the
-      // image revealed beneath is then full-bright from its first painted frame (no dim window).
-      releaseVideoPlane();
     }
 
     logEvent('lifecycle', `image src-set ${basename(nextItem.file_path)} [next=${toKey}]`);
@@ -823,7 +786,7 @@ export function AmbientViewerPage() {
       nextImg.addEventListener('load', handleLoad, { once: true });
       nextImg.addEventListener('error', handleErr, { once: true });
     }
-  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap, releaseVideoPlane]);
+  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap]);
 
   const runImageToVideo = useCallback((nextItem, nextIdx) => {
     const v = videoRef.current;
@@ -831,11 +794,6 @@ export function AmbientViewerPage() {
     const activeKey = activeImageRef.current;
     const activeImg = activeKey === 'A' ? imageARef.current : imageBRef.current;
     if (!activeImg) return;
-
-    // Re-acquire the video element (it was released to display:none while the image was showing) BEFORE
-    // src/load/play so it can decode. The outgoing image stays as the cover until the first real frame,
-    // so the (re)load latency is masked → still black-free.
-    acquireVideoPlane();
 
     const token = bumpToken();
     swapStartAtRef.current = performance.now();
@@ -902,7 +860,7 @@ export function AmbientViewerPage() {
         }, CROSSFADE_DURATION);
       });
     });
-  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop, acquireVideoPlane]);
+  }, [bumpToken, goState, logEvent, tokenValid, finalizeSwap, startFirstFrameLoop]);
 
   /* --------------------------------- ADVANCE -------------------------------- */
 
@@ -960,7 +918,6 @@ export function AmbientViewerPage() {
     logEvent('lifecycle', `render: init (${basename(item.file_path)})`);
 
     if (item.media_type === 'image') {
-      releaseVideoPlane();  // first item is an image → no active video plane (un-dims it on Tizen)
       const img = activeImageRef.current === 'A' ? imageARef.current : imageBRef.current;
       if (img) {
         img.style.transition = 'none';
@@ -971,7 +928,6 @@ export function AmbientViewerPage() {
     } else {
       const v = videoRef.current;
       if (v) {
-        acquireVideoPlane();  // first item is a video → ensure the element is live before src/play
         v.style.transition = 'none';
         v.style.opacity = '1';
         v.src = item.file_path;
@@ -994,7 +950,7 @@ export function AmbientViewerPage() {
 
     // Decode this item's last-frame poster (if a video) so its first swap can use it as a cover.
     preloadPoster(item);
-  }, [bumpToken, goState, logEvent, startPrefetch, preloadPoster, acquireVideoPlane, releaseVideoPlane]);
+  }, [bumpToken, goState, logEvent, startPrefetch, preloadPoster]);
 
   /* ----------------------------- AUTOSTART EFFECT --------------------------- */
 
@@ -1411,8 +1367,6 @@ export function AmbientViewerPage() {
   }, [logEvent, advance]);
 
   const handleVideoError = useCallback(() => {
-    // Ignore the synthetic error/emptied fired by our deliberate plane teardown (removeAttribute+load).
-    if (releasingPlaneRef.current) return;
     const v = videoRef.current;
     const code = v?.error?.code ?? '?';
     const msg = v?.error?.message ?? '';
@@ -1507,9 +1461,8 @@ export function AmbientViewerPage() {
     opacity: 0,
     transition: 'none',
     zIndex: z,
-    willChange: 'opacity',  // smooths the opacity crossfades. (The 3.2 theory that this caused the
-    // image darkness was DISPROVEN on-device — willChange=auto was still dark. The real cause is the
-    // mounted <video> holding the Tizen HW plane; fixed by releaseVideoPlane(). See changes.md 2026-06-23.)
+    willChange: 'opacity',  // smooths the opacity crossfades. (Removing it — the 3.2 image-darkness
+    // theory — was DISPROVEN on-device, so it stays. The image/video brightness difference is unrelated.)
     pointerEvents: 'none',
   });
 

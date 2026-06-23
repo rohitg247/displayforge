@@ -1998,3 +1998,14 @@ engines (separate elements), and the backend pipeline.
 - New `docs/ambient-architecture.md` — full subsystem map (modes, per-item engine, backend, data flow).
 - Optional follow-up (deferred): a dip-free image crossfade (fixed BASE/FADE layers, no z-index
   animation) to remove the slight mid-crossfade luminance dip — not bundled with this critical fix.
+
+### ⚠️ REVERTED 2026-06-23 (`3.3r-reverted`)
+The plane-release fix above **failed on-device and was reverted**. On the panel the plane *was*
+released after each video→image, yet the image stayed dark **and** collapsing the Tizen HW video plane
+reintroduced a brief **black flash** over the poster cover (the HW plane composites *above* HTML). So
+releasing the plane did NOT brighten the image → **the mounted `<video>` plane was never the cause**;
+the image renders true sRGB and it's the **video that the TV boosts**. Reverted all 3.3 code
+(`releaseVideoPlane`/`acquireVideoPlane` + call sites + `handleVideoError` guard); the per-item engine
+is now functionally identical to the last stable `52f81c2` (only differences: engine label and the
+larger announcement bar). **Deferred decision:** make the *video* match the image's calmer look (likely
+a TV-only CSS dim filter on `<video>`) — to be done as a separate change.
