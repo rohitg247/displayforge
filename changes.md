@@ -2009,3 +2009,21 @@ the image renders true sRGB and it's the **video that the TV boosts**. Reverted 
 is now functionally identical to the last stable `52f81c2` (only differences: engine label and the
 larger announcement bar). **Deferred decision:** make the *video* match the image's calmer look (likely
 a TV-only CSS dim filter on `<video>`) — to be done as a separate change.
+
+## 2026-06-24 — Brighten images on Tizen (CSS filter only) — `3.1-img-bright`
+
+Resolves the "images darker than video" issue the safe way, after the willChange/plane-release/FFmpeg
+theories were all disproven on-device. The image renders true sRGB; the **TV boosts the `<video>`** on
+its hardware plane, so graphics-plane `<img>` looks darker by comparison. Rather than fight the
+hardware overlay, **lift the images** with a pure CSS filter — no engine/transition/video changes.
+
+- New module consts (next to `CLIENT_KIND`): `TV_IMAGE_BRIGHTNESS = 1.15` (the tunable knob) and
+  `TV_IMAGE_FILTER = CLIENT_KIND === 'TV' ? brightness(...) : 'none'`.
+- `layerStyle()` now sets `filter: TV_IMAGE_FILTER` → lifts both image layers (z=2) **and** the poster
+  cover (z=3) together, so the video→image hard-cut stays brightness-consistent (no pop). Laptop/desktop
+  get `none` (already correct there).
+- Engine label → `3.1-img-bright` (label only). **Nothing else touched** — transitions, poster/bridge,
+  prefetch, loop, `<video>`, seamless/MSE engines all unchanged from stable `52f81c2`+announcement bar.
+- Tune on-panel by changing the single `TV_IMAGE_BRIGHTNESS` constant. One-line revert if undesired.
+- Firmware note: TV is on latest (1170); an upgrade is NOT pursued — it wouldn't reliably fix this and
+  risks destabilising the firmware-tuned engine.
