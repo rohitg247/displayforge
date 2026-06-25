@@ -161,3 +161,22 @@ and the image was **still dark**. willChange was never the cause (it's restored)
   the single mounted element (no engine refactor), reproduces v1's "no active plane during images", and
   stays black-free (the outgoing image cover masks the re-acquire). This is the contingency flagged in
   Addendum 1, now executed and evidence-backed.
+
+---
+
+### Addendum 3 — plane-release + brightness-filter both REVERTED; browser→AVPlay two-phase plan · 2026-06-26
+
+- **`3.3-img-plane-release` REVERTED:** on-device it did NOT brighten the image **and** tearing the HW
+  plane down reintroduced a black flash at video→image (the plane composites *above* the poster cover).
+  → the mounted-plane theory was wrong; restored the `52f81c2` baseline.
+- **`3.1-img-bright` (CSS brightness filter) REVERTED:** (a) unnecessary — the real playlist files look
+  identical in brightness (image vs video); the on-TV difference is the panel's video-plane picture
+  processing, not our content; (b) it **caused** an image→video flash — a CSS `filter` promotes the
+  `<img>` to a separate GPU layer that collides with the video plane at the hand-off. It was the only
+  diff from the known-good `AmbientViewerPage_latest_updated.jsx`, so removing it = byte-identical clean.
+- **Firmware fragility proven:** the same code clean on Chromium 94 flashed on Chromium 120 (TV
+  auto-update shifted the compositor timing). The browser cannot be future-proofed for mixed image+video.
+- **Decision (two phases; full record in root `plan.md` 2026-06-26):** **Phase 1** = browser fix (the
+  restored `3.1-loop-hardened` baseline; optional double-rAF hardening of `runVideoToImage`). **Phase 2
+  (if Phase 1 still flashes)** = native Tizen **`.wgt` + AVPlay** (MagicINFO's engine — HTML above the
+  video plane, `setVideoStillMode`, two-player MixedFrame), backend unchanged, staged behind a 2-clip PoC.

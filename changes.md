@@ -2027,3 +2027,31 @@ hardware overlay, **lift the images** with a pure CSS filter — no engine/trans
 - Tune on-panel by changing the single `TV_IMAGE_BRIGHTNESS` constant. One-line revert if undesired.
 - Firmware note: TV is on latest (1170); an upgrade is NOT pursued — it wouldn't reliably fix this and
   risks destabilising the firmware-tuned engine.
+
+## 2026-06-26 — REVERTED the brightness filter; Phase-1 of the browser→AVPlay plan — `3.1-loop-hardened`
+
+The `3.1-img-bright` brightness filter above is **reverted**. Two reasons, both confirmed:
+1. **It wasn't needed.** Viewing the real playlist files, the source images and videos look identical in
+   brightness/colour — the "darker images" only ever appeared as the panel's video-plane picture
+   processing, not anything in our content. The filter compensated for nothing real.
+2. **It caused a NEW black flash on image→video.** A CSS `filter` promotes the `<img>` layers to a
+   separate GPU compositing layer; at the image→video hand-off that re-composite collides with the
+   hardware video plane lighting up → flash. The filter was the **only** diff from the known-good
+   no-flash `AmbientViewerPage_latest_updated.jsx`, so removing it restores byte-identical clean
+   behaviour.
+
+**Change:** removed `TV_IMAGE_BRIGHTNESS` / `TV_IMAGE_FILTER` and the `filter:` line in `layerStyle()`;
+engine label back to `3.1-loop-hardened`. `AmbientViewerPage.jsx` is now byte-identical to the
+known-good baseline (+ larger announcement bar). No engine/transition/loop changes.
+
+**Strategic decision (full record in `docs/plan.md`):** the browser path is **firmware-fragile** — the
+same code that was flash-free on Chromium 94 flashes on Chromium 120 (the TV auto-updated), because the
+HW video plane composites above HTML and blanks on every `src` swap, and the compositor timing is
+firmware-decided. So the work is now **two phases**:
+- **Phase 1 (this commit):** fix what we can in the browser — remove the filter (kills the confirmed
+  image→video flash), restore the clean baseline; optional one-frame rAF hardening for the Chromium-120
+  video→image timing if it still flashes on-device.
+- **Phase 2 (if Phase 1 still flashes / edge-cases):** rebuild the player as a **native Tizen `.wgt`
+  using AVPlay** — MagicINFO's actual engine (HTML composites *above* the video plane; `setVideoStillMode`
+  holds the last frame with no blank; two-player MixedFrame for seamless hand-offs). Backend (FastAPI +
+  FFmpeg + CMS) stays unchanged; only the player changes. Staged behind a 2-clip on-device PoC.

@@ -1,10 +1,28 @@
 # Session handoff — Tizen ambient viewer: full-quality hybrid engine (v4) + flash fix
 
 **For:** the next thread / engineer picking this up.
-**Date:** 2026-06-22 (prev 2026-06-17). **Branch:** `main`.
-**Status:** **STABLE — verified working on the Samsung Tizen panel** (full-quality, black-free).
+**Date:** 2026-06-26 (prev 2026-06-22 / 06-17). **Branch:** `main`.
+**Status:** **STABLE baseline `3.1-loop-hardened`** (engine == known-good `52f81c2` + larger
+announcement bar). Browser-grade; see the two-phase plan below.
 
-> **Update 2026-06-23 (engine `3.3-img-plane-release`) — dark-image fix, CONFIRMED root cause:**
+> **CURRENT — Update 2026-06-26 (engine `3.1-loop-hardened`) — read this first:**
+> Both 2026-06-23 (`3.3-img-plane-release`) and 2026-06-24 (`3.1-img-bright`) experiments were
+> **REVERTED**. The viewer is back to the byte-identical known-good no-flash baseline.
+> - **Brightness:** a non-issue — source files look identical in brightness; the "darker images" was the
+>   panel's video-plane picture processing, not our content. The `3.1-img-bright` CSS filter was removed
+>   because it was unneeded **and** it caused an image→video flash (a CSS `filter` promotes the `<img>`
+>   to a GPU layer that collides with the video plane at the hand-off).
+> - **Flash reality:** the browser path is **firmware-fragile** — code clean on Chromium 94 flashed on
+>   Chromium 120 (TV auto-updated). The HW video plane composites above HTML and blanks on every `src`
+>   swap; the compositor timing is firmware-decided. The browser cannot guarantee zero-flash across
+>   firmwares.
+> - **Plan (full record in root `plan.md`, 2026-06-26 section):** **Phase 1** = fix in the browser
+>   (this baseline; optional double-rAF hardening of `runVideoToImage` if video→image still flashes).
+>   **Phase 2 (if Phase 1 still flashes)** = native Tizen **`.wgt` + AVPlay** (MagicINFO's engine: HTML
+>   above the video plane, `setVideoStillMode` holds the last frame, two-player MixedFrame). Backend
+>   (FastAPI) unchanged; staged behind a 2-clip on-device PoC.
+>
+> **SUPERSEDED — Update 2026-06-23 (engine `3.3-img-plane-release`) — REVERTED (caused a black flash):**
 > - The 2026-06-22 `willChange` theory was **DISPROVEN on-device** (`willChange=auto` still dark) and
 >   reverted. **Real cause:** since commit `529a304` the engine keeps one `<video>` always mounted;
 >   on Tizen a mounted `<video>` holds the hardware video plane (opacity:0 doesn't release it), which

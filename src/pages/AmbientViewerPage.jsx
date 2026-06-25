@@ -60,7 +60,7 @@ const basename = (p) => (p ? p.split('/').pop() : '');
 // build timestamp injected by Vite (see vite.config.js `define`). Both are printed in the on-screen
 // debugger so the exact build running on a panel can be confirmed at a glance — no guessing whether
 // a redeploy landed. Falls back to 'dev' under Vitest, which doesn't apply Vite `define`.
-const ENGINE_VERSION = '3.1-img-bright';
+const ENGINE_VERSION = '3.1-loop-hardened';
 const BUILD_STAMP = (typeof __AMBIENT_BUILD__ !== 'undefined') ? __AMBIENT_BUILD__ : 'dev';
 
 // Both the Samsung panel and a regular browser (laptop/desktop) can open ?debug=true and stream to the
@@ -72,12 +72,6 @@ const CLIENT_KIND = (() => {
   return /Tizen|SMART-TV|SmartHub|Web0S|webOS|NetCast|HbbTV|SmartTV/i.test(ua) ? 'TV' : 'laptop';
 })();
 const CLIENT_UA = (typeof navigator !== 'undefined' && navigator.userAgent) || '';
-
-// The Samsung TV boosts <video> on its hardware plane, so graphics-plane <img> looks darker by
-// comparison. Lift the images on Tizen ONLY so they match. Single knob — nudge if the on-panel match
-// isn't exact (raise = brighter; 1 = off). Laptop/desktop get no filter (already correct there).
-const TV_IMAGE_BRIGHTNESS = 1.15;   // start point; tune on-panel
-const TV_IMAGE_FILTER = CLIENT_KIND === 'TV' ? `brightness(${TV_IMAGE_BRIGHTNESS})` : 'none';
 
 export function AmbientViewerPage() {
   const { id } = useParams();
@@ -1468,7 +1462,6 @@ export function AmbientViewerPage() {
     transition: 'none',
     zIndex: z,
     willChange: 'opacity',
-    filter: TV_IMAGE_FILTER,   // TV-only brightness lift so images match the (boosted) video; 'none' on laptop
     pointerEvents: 'none',
   });
 
