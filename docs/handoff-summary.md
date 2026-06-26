@@ -56,9 +56,18 @@ mixed stream-copy↔re-encode joins produced decode-stall **seams** (stuck/skip 
 - **MSE gapless loop** handles all-video playlists (no image to absorb the restart).
 - **3-state `normalize_video`** + **lossless PNG posters** keep video and cover quality intact.
 
-This satisfies both hard requirements — **no black anywhere** (incl. the loop) and **no quality loss** —
-for every first/last combination. Native **AVPlay `.wgt`** remains the documented escalation if a *true*
-black ever appears at a video edge on a given firmware (it hasn't on the tested panel).
+This satisfies both hard requirements — no quality loss, and no black on the **originally tested
+firmware** — for every first/last combination.
+
+> **Current status (2026-06-26) — important caveat to the above.** The hybrid is black-free on the
+> firmware it was tuned on, **but the browser path is firmware-fragile**: the TV auto-updated
+> **Chromium 94 → 120**, which shifted the compositor timing and **reintroduced transition flashes with
+> the same code**. A browser app therefore **cannot guarantee zero-flash across firmware updates** (the
+> HW `<video>` plane composites above HTML and blanks on every `src` swap; the compositor timing is
+> firmware-decided). The forward path is now a **two-phase plan** — **Phase 1:** the restored
+> `3.1-loop-hardened` browser baseline (optional one-frame `runVideoToImage` hardening); **Phase 2 (if
+> it still flashes on-panel):** native Tizen **`.wgt` + AVPlay** (MagicINFO's engine). Full record in
+> root **`plan.md`** (2026-06-26 section) + `changes.md`.
 
 ---
 
@@ -78,6 +87,31 @@ black ever appears at a video edge on a given firmware (it hasn't on the tested 
 6. **Docs:** wrote `docs/ambient-playback-findings-and-fallback.md` (root cause + sources + AVPlay
    runbook) and `docs/ambient-fix-attempt-history.md` (every attempt, why it failed, what came next);
    consolidated the old `change.md` into `changes.md` (Appendix); refreshed this handoff.
+
+---
+
+## What we did 2026-06-22 → 06-26 (the brightness/flash saga → two-phase plan)
+Chased a reported "images look darker than video" on the panel, then a black flash. Net result: **three
+experiments tried and all REVERTED**, the real causes pinned, and the path forward decided. The viewer
+is back to the **`3.1-loop-hardened`** baseline (byte-identical to the known-good
+`AmbientViewerPage_latest_updated.jsx` + the larger announcement bar).
+1. **`3.2-img-truecolor`** (removed `willChange` from `<img>` layers) — disproven on-device, reverted.
+2. **`3.3-img-plane-release`** (release the HW plane while on an image) — didn't brighten **and**
+   reintroduced a video→image flash (the plane composites *above* the poster cover); reverted.
+3. **`3.1-img-bright`** (TV-only CSS `brightness` filter on the image layers) — **reverted**: it was
+   unnecessary (the real playlist source files look identical in brightness — the on-TV difference is
+   the panel's video-plane picture processing, not our content) **and** it CAUSED an image→video flash
+   (a CSS `filter` promotes the `<img>` to a GPU layer that collides with the video plane at the
+   hand-off). It was the only diff from the known-good baseline, so removing it = byte-identical clean.
+4. **Firmware fragility proven:** code that was flash-free on **Chromium 94** flashed on **Chromium 120**
+   after the TV auto-updated → the browser path can't be future-proofed.
+5. **MagicINFO (the bar) is native AVPlay:** `setVideoStillMode()` holds the last frame with no blank +
+   two-player MixedFrame; in a native app HTML composites **above** the video plane. That's the only way
+   to truly match it.
+6. **Decision — two phases (full record in root `plan.md`, 2026-06-26):** **Phase 1** = browser baseline
+   above (+ optional double-`rAF` hardening of `runVideoToImage` if video→image still flashes on Chromium
+   120). **Phase 2 (if Phase 1 still flashes)** = native Tizen **`.wgt` + AVPlay**, backend (FastAPI)
+   unchanged, staged behind a 2-clip on-device PoC. Awaiting on-panel verification of Phase 1.
 
 ---
 
@@ -117,16 +151,23 @@ black ever appears at a video edge on a given firmware (it hasn't on the tested 
   `playlist_video_path` is no longer served; `_regenerate_playlist_video` clears it and deletes the file.
 - The early per-item / pre-buffer / canvas-bridge attempts — see the attempt-history doc.
 
-## Escalation (only if a true black appears on a panel)
+## Phase 2 (planned, if Phase 1 still flashes on-panel) — native AVPlay `.wgt`
 Native **`webapis.avplay`** in a packaged, signed Tizen `.wgt` (free; USB or URL Launcher install). Reuses
-the FastAPI back-end / uploads / playlist UI; only the player layer changes. Even AVPlay flashes once on
-the first loop, and SSSP is deprecated since Tizen 6.5 — full runbook + caveats in
-`docs/ambient-playback-findings-and-fallback.md` (Approach 2) and `docs/tizen-avplay-seamless.md`.
+the FastAPI back-end / uploads / playlist UI; only the player layer changes. This is **MagicINFO's actual
+engine** and the only way to truly beat the browser's plane blanking (HTML composites above the AVPlay
+plane; `setVideoStillMode` holds the last frame; two-player MixedFrame hands off seamlessly). Staged
+behind a **2-clip on-device PoC** before any full port. Caveats: even AVPlay flashes once on the first
+1→2 switch (maskable), and SSSP is deprecated since Tizen 6.5. Full runbook + caveats in
+`docs/ambient-playback-findings-and-fallback.md` (Approach 2), `docs/tizen-avplay-seamless.md`, and the
+two-phase record in root `plan.md` (2026-06-26).
 
 ## Related docs
+- **`plan.md`** (repo root) — the durable two-phase plan record (2026-06-26): findings, Phase 1 browser
+  fix, Phase 2 native AVPlay, commit strategy. Read this for "where we stopped and why".
+- `docs/ambient-architecture.md` — full subsystem map (modes, per-item engine, backend, data flow).
 - `docs/ambient-playback-findings-and-fallback.md` — root cause, Tizen constraints, sources, AVPlay runbook.
-- `docs/ambient-fix-attempt-history.md` — every attempt (1–10), what failed, why the next followed.
-- `changes.md` — dated changelog (2026-06-16 v4 hybrid, 2026-06-17 flash fix) + Appendix of early diffs.
+- `docs/ambient-fix-attempt-history.md` — every attempt (1–10 + Addenda 1–3), what failed, why the next followed.
+- `changes.md` — dated changelog (… 2026-06-16 v4 hybrid → 2026-06-26 filter revert / Phase-1) + Appendix.
 - `docs/deployment-steps.md` — deploy/backfill commands.
 
 ## Verify / deploy
