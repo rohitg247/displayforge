@@ -10,6 +10,12 @@ const CROSSFADE_DURATION = 500;
 // window with real pixels, so a generous timeout has zero visual cost — it just lets the decode
 // complete naturally before any cover is released.
 const SWAP_TIMEOUT_MS = 4000;
+// 2026-06-27: cap concurrent prefetch fetches. Previously startPrefetch fired an unbounded fetch() on
+// every swap (~every 5s); on a congested link each takes 15-29s and they stack 3-6 deep, dividing the
+// bandwidth and starving the next <video>.load() (observed: 44s to loadedmetadata -> swap-timeout). A
+// serial FIFO queue lets a single ~250kB image finish in ~1-2s instead of 29s split six ways. Raise to
+// 2 only if a fast link is being under-utilised. See plan: prefetch congestion fix.
+const PREFETCH_MAX_CONCURRENCY = 1;
 const POLL_INTERVAL = 5000;
 const DECODE_SLOW_THRESHOLD_MS = 800;
 const FRAME_STUCK_WARN_MS = 500;
@@ -133,6 +139,9 @@ export function AmbientViewerPage() {
   const activeImageRef = useRef('A');
   const swapTokenRef = useRef(0);
   const prefetchRef = useRef(new Map());
+  const prefetchQueueRef = useRef([]);     // FIFO of items waiting to be fetched (concurrency-capped)
+  const prefetchActiveRef = useRef(0);     // in-flight prefetch count (<= PREFETCH_MAX_CONCURRENCY)
+  const videoLoadingRef = useRef(false);   // true while a <video> swap is mid-load — pauses prefetch
   const swapDeadlineRef = useRef(null);
   const rafRef = useRef(null);
   const earlyBridgeArmedRef = useRef(false);
@@ -276,29 +285,52 @@ export function AmbientViewerPage() {
 
   /* -------------------------------- PREFETCH -------------------------------- */
 
+  // Drain the FIFO prefetch queue up to PREFETCH_MAX_CONCURRENCY in-flight transfers. Gated by
+  // videoLoadingRef so image prefetches never compete with an in-progress <video>.load() for the link.
+  const pumpPrefetch = useCallback(() => {
+    while (
+      prefetchActiveRef.current < PREFETCH_MAX_CONCURRENCY &&
+      prefetchQueueRef.current.length > 0 &&
+      !videoLoadingRef.current
+    ) {
+      const item = prefetchQueueRef.current.shift();
+      const url = item.file_path;
+      prefetchActiveRef.current += 1;
+      prefetchNameRef.current = basename(url);
+      prefetchStatusRef.current = 'loading';
+      logEvent('lifecycle', `prefetch start ${basename(url)}`);
+      const t0 = performance.now();
+      const promise = fetch(url, { cache: 'force-cache' })
+        .then((r) => r.blob())
+        .then((blob) => {
+          const elapsed = Math.round(performance.now() - t0);
+          const kb = Math.round(blob.size / 1024);
+          prefetchStatusRef.current = 'cached';
+          logEvent('success', `prefetch ok (${elapsed}ms, ${kb}kB)`);
+          return blob;
+        })
+        .catch((err) => {
+          prefetchStatusRef.current = 'fail';
+          logEvent('warn', `prefetch fail ${err?.message ?? err}`);
+        })
+        .finally(() => {
+          prefetchActiveRef.current -= 1;
+          pumpPrefetch();
+        });
+      prefetchRef.current.set(url, promise); // replace the reservation placeholder with the real promise
+    }
+  }, [logEvent]);
+
+  // Enqueue N+1 (deduped against everything queued/in-flight/done) and kick the runner. The actual
+  // fetch is deferred to pumpPrefetch so swaps never pile up unbounded concurrent transfers.
   const startPrefetch = useCallback((item) => {
     if (!item) return;
     const url = item.file_path;
-    if (prefetchRef.current.has(url)) return;
-    prefetchNameRef.current = basename(url);
-    prefetchStatusRef.current = 'loading';
-    logEvent('lifecycle', `prefetch start ${basename(url)}`);
-    const t0 = performance.now();
-    const promise = fetch(url, { cache: 'force-cache' })
-      .then((r) => r.blob())
-      .then((blob) => {
-        const elapsed = Math.round(performance.now() - t0);
-        const kb = Math.round(blob.size / 1024);
-        prefetchStatusRef.current = 'cached';
-        logEvent('success', `prefetch ok (${elapsed}ms, ${kb}kB)`);
-        return blob;
-      })
-      .catch((err) => {
-        prefetchStatusRef.current = 'fail';
-        logEvent('warn', `prefetch fail ${err?.message ?? err}`);
-      });
-    prefetchRef.current.set(url, promise);
-  }, [logEvent]);
+    if (prefetchRef.current.has(url)) return; // already queued, in-flight, or cached
+    prefetchRef.current.set(url, null);       // reserve the URL immediately so it isn't re-enqueued
+    prefetchQueueRef.current.push(item);
+    pumpPrefetch();
+  }, [pumpPrefetch]);
 
   /* ----------------------------- POSTER PRELOAD ----------------------------- */
 
@@ -379,7 +411,9 @@ export function AmbientViewerPage() {
     mediaRef.current = pending.media;
     const stillIdx = pending.media.findIndex((m) => m.file_path === oldPath);
     currentIdxRef.current = stillIdx >= 0 ? stillIdx : 0;
+    // Drop the old playlist's prefetch state so stale URLs don't keep downloading on the new media set.
     prefetchRef.current.clear();
+    prefetchQueueRef.current.length = 0;
     return true;
   }, [logEvent]);
 
@@ -458,6 +492,10 @@ export function AmbientViewerPage() {
     if (rafRef.current) { cancelAnimationFrame(rafRef.current); rafRef.current = null; }
     lastSwapMsRef.current = Math.round(performance.now() - swapStartAtRef.current);
     earlyBridgeArmedRef.current = false;
+    // The video load (if any) is done — release the prefetch gate and resume the queue. This is the
+    // single convergence point for both video-swap paths (normal completion and the swap-timeout force).
+    videoLoadingRef.current = false;
+    pumpPrefetch();
     goState(STATE_PLAYING);
 
     if (applyPendingIfNeeded()) {
@@ -477,7 +515,7 @@ export function AmbientViewerPage() {
 
     // Decode the now-current video's last-frame poster so the next video->video swap can use it.
     preloadPoster(mediaRef.current[currentIdxRef.current]);
-  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch, preloadPoster]);
+  }, [tokenValid, goState, applyPendingIfNeeded, startPrefetch, preloadPoster, pumpPrefetch]);
 
   /* ---------------------------- TRANSITION CASES ---------------------------- */
 
@@ -558,6 +596,9 @@ export function AmbientViewerPage() {
 
     const url = nextItem.file_path;
     logEvent('lifecycle', `src-set ${basename(url)}`);
+    // Pause image prefetch while this video loads so the <video>.load() owns the link (cleared in
+    // finalizeSwap). Without this, stacked image fetches starve the decoder -> 44s metadata + swap-timeout.
+    videoLoadingRef.current = true;
     v.src = url;
     v.load();
     logEvent('lifecycle', 'load() called');
@@ -803,6 +844,8 @@ export function AmbientViewerPage() {
     logEvent('lifecycle', `src-set ${basename(url)}`);
     v.style.transition = 'none';
     v.style.opacity = '0';
+    // Pause image prefetch while this video loads (cleared in finalizeSwap) — see runVideoToVideo.
+    videoLoadingRef.current = true;
     v.src = url;
     v.load();
     logEvent('lifecycle', 'load() called');

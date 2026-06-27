@@ -2055,3 +2055,48 @@ firmware-decided. So the work is now **two phases**:
   using AVPlay** — MagicINFO's actual engine (HTML composites *above* the video plane; `setVideoStillMode`
   holds the last frame with no blank; two-player MixedFrame for seamless hand-offs). Backend (FastAPI +
   FFmpeg + CMS) stays unchanged; only the player changes. Staged behind a 2-clip on-device PoC.
+
+## 2026-06-27 — Prefetch congestion fix: concurrency-capped queue + video-load priority — `3.1-loop-hardened`
+
+**File:** `src/pages/AmbientViewerPage.jsx` (per-item engine prefetch scheduler only — no transition,
+loop, or backend changes).
+
+### Problem (new failure mode, not a regression)
+On-panel debug logs for display 2 (2026-06-26) showed the engine running healthy for ~3.5 min (image
+swaps every ~5s, decodes 150–380 ms), then the **second video** (`…-1777293481-0-norm.mp4`) took **~44 s**
+to reach `loadedmetadata` (loadstart 14:20:11 → loadedmetadata 14:20:55). The first video on the same TV
+loaded in ~0.6 s, so the engine didn't slow down — **the network did**. The `swap-timeout (4000ms)`
+backstop fired and force-faded to a frameless plane (`rs=0 ct=0.00`) → the ~40 s black/frozen stall.
+
+**Root cause:** `startPrefetch` fired an **unbounded** `fetch(url, {cache:'force-cache'})` on every swap
+(~every 5s). On a congested link each took 15–29 s and they **stacked 3–6 deep** (prefetch durations
+climbed monotonically across the run for identical ~250–300 kB files: 149 ms → 8 s → 14 s → 25 s → 29 s,
+with 3 resolving together repeatedly). They divided the bandwidth and starved the next `<video>.load()`.
+A `git diff` confirmed the prefetch code is **byte-identical to `AmbientViewerPage Finally Working
+Stable.jsx`** — that build only "worked perfectly" because the link was healthy when it was tested; it
+fails identically under the congested link. So this is graceful-degradation hardening, not a rollback.
+
+### Fix
+1. **Serial FIFO prefetch queue.** New `PREFETCH_MAX_CONCURRENCY = 1` (old unbounded behaviour documented
+   in the constant comment). `startPrefetch` now **enqueues** (deduped via the existing `prefetchRef` Map,
+   reserving the URL with a `null` placeholder) and kicks `pumpPrefetch()`; `pumpPrefetch` runs at most
+   one transfer at a time using the unchanged `fetch → blob → log` chain, decrementing + re-pumping in a
+   `.finally`. A single ~250 kB image now finishes in ~1–2 s instead of 29 s split six ways.
+2. **Player priority.** New `videoLoadingRef` gate: `runVideoToVideo` / `runImageToVideo` set it `true`
+   right before `<video>.src + load()`, so `pumpPrefetch` won't start image fetches that compete with the
+   decoder for the link. `finalizeSwap` (the single convergence for both the normal and swap-timeout-forced
+   video paths) clears it and resumes the queue.
+3. **Playlist-change cleanup.** `applyPendingIfNeeded` now also empties `prefetchQueueRef` (it already
+   cleared `prefetchRef`) so stale URLs from the old playlist stop downloading.
+
+`SWAP_TIMEOUT_MS` is **unchanged** — the fix removes the starvation rather than tolerating it longer.
+
+### Verify
+- `npm run lint` + `npm run build` green.
+- **On-panel `?debug=true`** (laptop caches in memory and hides this): `prefetch start`/`prefetch ok` no
+  longer overlap 3-deep and a single image stays ~1–2 s; the next-video transition reaches
+  `loadedmetadata` in ~1–2 s; **no `swap-timeout (4000ms)` / `frame-stuck rs=0`** at video edges;
+  `ERRORS: 0` over a full multi-cycle loop with no ~40 s black stall. Compare the transcript at
+  `…/2/debug-log/latest` against the 2026-06-26 baseline.
+- If single transfers are **still** 15–29 s for 250 kB after the cap, the bottleneck is server/network
+  (on-demand `-norm.mp4` transcode or weak TV Wi-Fi), not the viewer → separate investigation.

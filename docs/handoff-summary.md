@@ -5,7 +5,20 @@
 **Status:** **STABLE baseline `3.1-loop-hardened`** (engine == known-good `52f81c2` + larger
 announcement bar). Browser-grade; see the two-phase plan below.
 
-> **CURRENT — Update 2026-06-26 (engine `3.1-loop-hardened`) — read this first:**
+> **CURRENT — Update 2026-06-27 (engine `3.1-loop-hardened`) — prefetch congestion fix:**
+> On-panel logs (display 2, 06-26) exposed a **new, network-driven** failure: a video took **~44 s** to
+> reach `loadedmetadata` and tripped the 4000 ms `swap-timeout` (a ~40 s black stall). Cause was **not**
+> a transition bug — `startPrefetch` fired **unbounded** concurrent `fetch()`es (one per ~5 s swap) that,
+> on a congested link, stacked 3–6 deep (250 kB transfers ballooning 149 ms → 29 s) and **starved the
+> next `<video>.load()`**. The prefetch code is byte-identical to `…Finally Working Stable.jsx`, which
+> only "worked" because the link was healthy at test time. **Fix (this commit):** serial FIFO prefetch
+> queue (`PREFETCH_MAX_CONCURRENCY = 1`) + a `videoLoadingRef` gate that pauses prefetch while a video
+> loads (cleared in `finalizeSwap`). No transition/loop/backend change; `SWAP_TIMEOUT_MS` untouched.
+> Full detail in `changes.md` (2026-06-27). **Still needs on-panel verification.** If single 250 kB
+> transfers stay 15–29 s after the cap, the bottleneck is server/network (on-demand `-norm.mp4` transcode
+> or weak TV Wi-Fi), not the viewer.
+>
+> **Update 2026-06-26 (engine `3.1-loop-hardened`):**
 > Both 2026-06-23 (`3.3-img-plane-release`) and 2026-06-24 (`3.1-img-bright`) experiments were
 > **REVERTED**. The viewer is back to the byte-identical known-good no-flash baseline.
 > - **Brightness:** a non-issue — source files look identical in brightness; the "darker images" was the
