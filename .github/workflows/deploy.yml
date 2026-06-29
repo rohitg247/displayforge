@@ -8,7 +8,7 @@ on:
 jobs:
   deploy:
     name: Deploy to Server
-    runs-on: self-hosted
+    runs-on: [self-hosted, signage-server]
 
     steps:
       - name: Update Code and Restart Docker
