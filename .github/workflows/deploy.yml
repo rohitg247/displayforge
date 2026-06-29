@@ -1,4 +1,4 @@
-name: CI/CD Deploy to Docker
+name: CI/CD Deploy to Existing Directory
 
 on:
   push:
@@ -8,27 +8,20 @@ on:
 jobs:
   deploy:
     name: Deploy to Server
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
 
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Deploy via SSH
-        uses: appleboy/ssh-action@v1.0.3
-        with:
-          host: ${{ secrets.SERVER_HOST }}
-          username: ${{ secrets.SERVER_USER }}
-          key: ${{ secrets.SERVER_SSH_KEY }}
-          script: |
-            # Navigate to your project directory on the server
-            # Update this path to where your project lives on the server
-            cd /opt/projects/Digital-Signage-System/
-            
-            # Pull the latest code from the main branch
-            git pull origin main
-            
-            # Rebuild the images and restart the containers
-            # The -d flag runs them in the background
-            # The --build flag ensures any new dependencies or code changes are baked into the image
-            docker compose up -d --build
+      - name: Update Code and Restart Docker
+        run: |
+          # 1. Navigate to your specific deployment directory
+          # REPLACE THIS with your actual path on the server
+          cd /opt/projects/Digital-Signage-System/
+          
+          # 2. Pull the latest code from GitHub
+          # (This assumes the folder is already a git repository connected to origin)
+          git fetch origin
+          git reset --hard origin/main
+          
+          # 3. Rebuild and restart the Docker containers
+          # The --build flag ensures frontend/backend Dockerfiles pick up new changes
+          docker compose up -d --build
