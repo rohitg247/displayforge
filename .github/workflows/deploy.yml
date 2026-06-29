@@ -15,13 +15,13 @@ jobs:
         run: |
           # 1. Navigate to your specific deployment directory
           # REPLACE THIS with your actual path on the server
-          cd /opt/projects/Digital-Signage-System/
+          sudo cd /opt/projects/Digital-Signage-System/
           
           # 2. Pull the latest code from GitHub
           # (This assumes the folder is already a git repository connected to origin)
-          git fetch origin
-          git reset --hard origin/main
+          sudo git fetch origin
+          sudo git reset --hard origin/main
           
           # 3. Rebuild and restart the Docker containers
           # The --build flag ensures frontend/backend Dockerfiles pick up new changes
-          docker compose up -d --build
+          sudo docker compose up -d --build
