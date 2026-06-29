@@ -9,7 +9,7 @@ export function AdminNav() {
     { label: 'Dashboard', path: '/admin/dashboard', icon: BarChart3 },
     { label: 'Branches', path: '/admin/branches', icon: Building2 },
     { label: 'Displays', path: '/admin/displays', icon: Monitor },
-    { label: 'Ambient Dis', path: '/admin/ambient', icon: Tv2 },
+    { label: 'Ambient Displays', path: '/admin/ambient', icon: Tv2 },
     // { label: 'Ambient Displays', path: '/admin/ambient', icon: Tv2 },
   ];
 
