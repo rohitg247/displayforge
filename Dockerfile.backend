@@ -3,7 +3,13 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install sqlite3 (debugging) and ffmpeg (last-frame poster extraction for ambient videos)
-RUN apt-get update && apt-get install -y sqlite3 ffmpeg && rm -rf /var/lib/apt/lists/*
+#Old Install Command
+#RUN apt-get update && apt-get install -y sqlite3 ffmpeg && rm -rf /var/lib/apt/lists/*
+
+#New Install Command suggested by Gemini during CI/CD Setup.
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends sqlite3 ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
 
 # Copy requirements and install
 COPY server/requirements.txt server/
