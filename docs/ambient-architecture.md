@@ -122,6 +122,11 @@ The backend decides per request (see §4.2). seamless/mse use their own `<video>
   only when forced. Keeps quality; output `-pix_fmt yuv420p` (no explicit colour-range signalling).
 - `extract_last_frame` → lossless PNG (`rgb24`) poster = black-free freeze-frame cover for the panel.
 - `extract_first_frame` → admin-grid thumbnail.
+- `normalize_image` / `probe_image` / `image_aspect_warning` (2026-07-01) — image-safety contract at
+  upload: auto-downscale an image only if it exceeds the 1920×1080 ceiling (Lanczos, aspect kept, never
+  upscaled/cropped) + warn (or `AMBIENT_IMAGE_STRICT`-reject) on off-aspect. Conforming images stored
+  byte-for-byte. See `docs/media-pipeline-map.md`. Regenerate legacy `.jpg` posters as `.png` with
+  `backfill_posters.py --force-posters` (DB-first).
 - `build_video_run` — stream-copy adjacent in-spec videos into one motion-seamless clip (strict gate:
   codec/profile/level, w×h, fps, time_base, SAR, start_pts).
 - `build_mse_loop` — one fragmented video-only clip for the MSE gapless loop.

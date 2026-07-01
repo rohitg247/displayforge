@@ -1,5 +1,5 @@
 import { Link, useLocation } from 'react-router-dom';
-import { BarChart3, Monitor, ChevronRight, Building2, Tv2 } from 'lucide-react';
+import { BarChart3, Monitor, ChevronRight, Building2, Tv2, ShieldCheck } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 export function AdminNav() {
@@ -10,7 +10,7 @@ export function AdminNav() {
     { label: 'Branches', path: '/admin/branches', icon: Building2 },
     { label: 'Displays', path: '/admin/displays', icon: Monitor },
     { label: 'Ambient Displays', path: '/admin/ambient', icon: Tv2 },
-    // { label: 'Ambient Displays', path: '/admin/ambient', icon: Tv2 },
+    { label: 'Devices', path: '/admin/devices', icon: ShieldCheck },
   ];
 
   return (

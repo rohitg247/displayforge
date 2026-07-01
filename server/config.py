@@ -37,5 +37,30 @@ class Settings:
     # Default on-screen seconds for an image segment when no per-item duration is set.
     AMBIENT_IMAGE_SECONDS: int = int(os.getenv("AMBIENT_IMAGE_SECONDS", "5"))
 
+    # --- Image-safety contract (uploads) ----------------------------------------------------------
+    # An uploaded image whose long/short side exceeds the Tizen FullHD ceiling (1920x1080, mirrored for
+    # portrait) is auto-DOWNSCALED once at upload (Lanczos, aspect preserved, never upscaled) — one
+    # high-quality resample beats letting the panel re-downsample every render, and it removes the
+    # oversized-decode memory risk. See media_utils.normalize_image.
+    # Aspect tolerance: how far an image's aspect ratio may deviate from the display's target
+    # (16:9 landscape / 9:16 portrait) before it is flagged. 0.05 = 5%.
+    AMBIENT_IMAGE_ASPECT_TOLERANCE: float = float(os.getenv("AMBIENT_IMAGE_ASPECT_TOLERANCE", "0.05"))
+    # STRICT: hard-REJECT (HTTP 400) an off-aspect image instead of accepting it with a warning.
+    # Default OFF (warn only) so uploads are never blocked unexpectedly.
+    AMBIENT_IMAGE_STRICT: bool = os.getenv("AMBIENT_IMAGE_STRICT", "false").lower() in ("1", "true", "yes")
+
+    # --- Display-URL device auth (Part D) ---------------------------------------------------------
+    # Master switch for gating the public display URLs (/:branch/1/:id, /:branch/2/:id + debug-log)
+    # behind a one-time, revocable device session. Default OFF so existing displays keep rendering
+    # with no login until this is deliberately enabled and each display is paired.
+    DISPLAY_AUTH_ENABLED: bool = os.getenv("DISPLAY_AUTH_ENABLED", "false").lower() in ("1", "true", "yes")
+    # Persistent httpOnly cookie holding the display's device JWT (separate from the admin session).
+    DEVICE_COOKIE_NAME: str = os.getenv("DEVICE_COOKIE_NAME", "actis_device")
+    # Device sessions are kiosk-lived: a long JWT expiry (days) + server-side revocation via the
+    # display_devices table (a revoked jti is rejected on every viewer request, so this is a backstop).
+    DEVICE_JWT_EXPIRE_DAYS: int = int(os.getenv("DEVICE_JWT_EXPIRE_DAYS", "3650"))
+    # QR pairing codes are short-lived + single-use.
+    DEVICE_PAIR_CODE_TTL_SECONDS: int = int(os.getenv("DEVICE_PAIR_CODE_TTL_SECONDS", "600"))
+
 
 settings = Settings()

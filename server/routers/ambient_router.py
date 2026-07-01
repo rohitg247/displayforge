@@ -7,7 +7,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Form, Query, Request
 from fastapi.responses import PlainTextResponse
 from ..database import db_dependency
-from ..auth import get_current_user
+from ..auth import get_current_user, get_display_viewer
 from ..config import settings
 from ..models import (
     AmbientDisplayCreate,
@@ -18,7 +18,16 @@ from ..models import (
     ActivePlaylistRequest,
     PublishPlaylistRequest,
 )
-from ..media_utils import extract_last_frame, extract_first_frame, normalize_video, build_video_run, build_mse_loop
+from ..media_utils import (
+    extract_last_frame,
+    extract_first_frame,
+    normalize_video,
+    build_video_run,
+    build_mse_loop,
+    normalize_image,
+    probe_image,
+    image_aspect_warning,
+)
 
 router = APIRouter()
 
@@ -328,6 +337,7 @@ def get_ambient_display(
     playlist: str = Query(default=None),
     admin: bool = Query(default=False),
     db: sqlite3.Connection = Depends(db_dependency),
+    _viewer: None = Depends(get_display_viewer),
 ):
     disp = db.execute(
         "SELECT * FROM ambient_displays WHERE id = ?", (display_id,)
@@ -648,12 +658,19 @@ def upload_ambient_media(
     if playlist not in ("A", "B"):
         playlist = "A"
 
-    disp = db.execute("SELECT id FROM ambient_displays WHERE id = ?", (display_id,)).fetchone()
+    disp = db.execute(
+        "SELECT id, COALESCE(draft_orientation, orientation) AS orientation FROM ambient_displays WHERE id = ?",
+        (display_id,),
+    ).fetchone()
     if not disp:
         raise HTTPException(status_code=404, detail="Ambient display not found")
+    orientation = disp["orientation"] or "landscape"
 
     upload_dir = Path(settings.UPLOAD_DIR)
     upload_dir.mkdir(exist_ok=True)
+
+    # Image-safety warnings (aspect/size) collected across this batch and returned to the admin UI.
+    warnings = []
 
     # Optional per-file image durations (seconds), comma-separated and aligned to `files` by index.
     # FULLY OPTIONAL and backward-compatible: the current upload UI doesn't send it, so every entry is
@@ -725,6 +742,29 @@ def upload_ambient_media(
             thumb_filename = f"{Path(filename).stem}-thumb.jpg"
             if extract_first_frame(filepath, upload_dir / thumb_filename):
                 thumb_path = f"/uploads/{thumb_filename}"
+        elif media_type == "image":
+            # Image-safety contract: (1) downscale ONLY if the image exceeds the 1920x1080 Tizen
+            # ceiling — one high-quality Lanczos resample, aspect preserved, never upscaled/cropped —
+            # overwriting the original under the same name/URL; (2) warn (or, under AMBIENT_IMAGE_STRICT,
+            # reject) when the aspect ratio doesn't match the display's target. Best-effort: an ffmpeg
+            # miss just serves the original bytes.
+            fit_path = upload_dir / f"{Path(filename).stem}-fit{ext}"
+            if normalize_image(filepath, fit_path) == "written":
+                fit_path.replace(filepath)  # atomic overwrite; same filename → served URL unchanged
+                warnings.append(f"{file.filename}: downscaled to fit the 1920x1080 panel ceiling")
+            meta = probe_image(filepath)
+            if meta:
+                aspect_warn = image_aspect_warning(
+                    meta["w"], meta["h"], orientation, settings.AMBIENT_IMAGE_ASPECT_TOLERANCE
+                )
+                if aspect_warn:
+                    if settings.AMBIENT_IMAGE_STRICT:
+                        try:
+                            filepath.unlink()
+                        except OSError:
+                            pass
+                        raise HTTPException(status_code=400, detail=f"{file.filename}: {aspect_warn}")
+                    warnings.append(f"{file.filename}: {aspect_warn}")
 
         # Per-image on-screen seconds (images only; NULL for video → uses its own length).
         duration = _parse_duration(i) if media_type == "image" else None
@@ -748,7 +788,7 @@ def upload_ambient_media(
             "duration": duration,
         })
 
-    return {"media": uploaded}
+    return {"media": uploaded, "warnings": warnings}
 
 
 @router.put("/{display_id}/media/reorder")
@@ -865,7 +905,11 @@ async def post_ambient_debug_log(display_id: int, request: Request):
 
 
 @router.get("/{display_id}/debug-log/latest", response_class=PlainTextResponse)
-def get_ambient_debug_log_latest(display_id: int, date: str = Query(default=None)):
+def get_ambient_debug_log_latest(
+    display_id: int,
+    date: str = Query(default=None),
+    _viewer: None = Depends(get_display_viewer),
+):
     """Return a day's FULL debug transcript as plain text (open in a browser, select-all, paste).
     Defaults to the most recent day; pass `?date=YYYY-MM-DD` to view another of the retained days.
     No-cache so a refresh always shows the newest events."""

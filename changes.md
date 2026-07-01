@@ -2100,3 +2100,53 @@ fails identically under the congested link. So this is graceful-degradation hard
   `…/2/debug-log/latest` against the 2026-06-26 baseline.
 - If single transfers are **still** 15–29 s for 250 kB after the cap, the bottleneck is server/network
   (on-demand `-norm.mp4` transcode or weak TV Wi-Fi), not the viewer → separate investigation.
+
+## 2026-07-01 — Image-safety contract + poster sharpen flag + display-URL device auth; dark-frame diagnosis locked
+
+Three shipped changes + one diagnosis lock-in. Full plan/rationale in `docs/media-pipeline-map.md`.
+
+### Dark-frame diagnosis (LOCKED — no new brightness code)
+The "darker last frame / images" is **confirmed Samsung/Tizen panel behaviour** (the TV boosts the HW
+video plane; the graphics-plane `<img>`/poster render true sRGB and look dimmer by comparison). Re-verified
+2026-07-01 that the content pixels are plain 8-bit sRGB with no ICC profile and are not darker. Every
+browser fix for this was already reverted (`will-change`, HW-plane release, CSS brightness, ffmpeg colour)
+— the only structural fix is AVPlay (out of scope). A **separate** true-black at the playlist **loop
+restart** (image→video wrap) is being tracked: `runImageToVideo` holds the outgoing image until ≥2 video
+frames paint, so it's black-free in the DOM; the likely trigger is the Tizen video plane blanking above
+HTML on `src`-swap, exposed by the TV's Chromium 94→120 update (NOT the prefetch commit `9b001c7`). Bisect
+on-panel at the pre-`9b001c7` commit to confirm.
+
+### 1. Poster sharpen — `backfill_posters.py --force-posters`
+Old media rows still serve a legacy `.jpg` "soft" poster (current code writes lossless `.png`). A normal
+backfill skips rows that already have a poster; `--force-posters` regenerates `.jpg` (or missing) posters
+as `.png`, **DB-first** (write `.png` → repoint row → delete old `.jpg` only on success — never leaves a
+row poster-less). Rows already on `.png` are untouched. Sharpness only; does not affect the dimming.
+
+### 2. Image-safety contract (uploads)
+New `media_utils.probe_image` / `normalize_image` (3-state, ffmpeg-only, mirrors `normalize_video`) +
+`image_aspect_warning`. On upload (`ambient_router.upload_ambient_media`), an image is **auto-downscaled
+only if it exceeds the 1920×1080 ceiling** (Lanczos, aspect preserved, never upscaled/cropped), then its
+aspect is checked against the display's target and a **warning** is returned (surfaced as an admin toast)
+— or **rejected** (HTTP 400) under `AMBIENT_IMAGE_STRICT`. Config: `AMBIENT_IMAGE_ASPECT_TOLERANCE` (0.05),
+`AMBIENT_IMAGE_STRICT` (off). Conforming images are still stored byte-for-byte.
+
+### 3. Display-URL one-time device auth (behind `DISPLAY_AUTH_ENABLED`, default OFF)
+The public display URLs (`/:branch/1/:id`, `/:branch/2/:id`, debug-log) can be gated behind a revocable,
+kiosk-lived device session — multi-tenant-ready (scoped per branch+display; extends to client/tenant).
+- **Backend:** `display_devices` table (idempotent, in `init_db`); `auth.create_device_token` +
+  `auth.get_display_viewer` (allows an admin session OR a valid, **non-revoked** `actis_device` cookie —
+  revocation enforced by `jti` lookup on **every** viewer request); auth router endpoints — QR pairing
+  (`/pair/start` · admin `/pair/approve` · display poll `GET /pair/{code}`; codes short-lived + single-use),
+  password fallback (`/device-login`), and admin `GET /devices` + `POST /devices/{id}/revoke`. The live
+  reads `GET /api/ambient/{id}`, `GET /api/displays/{id}` and the debug-log GET now depend on
+  `get_display_viewer`.
+- **Frontend:** `ProtectedDisplayRoute` (probe → show `DisplayLoginPage` on 401, fail-open on other
+  errors), `DisplayLoginPage` (QR pairing via `qrcode.react` + password fallback), `/pair/:code`
+  `PairApprovePage` (admin), admin **Devices** page (list/revoke), `api.js` device-auth calls +
+  `credentials:'include'` on the viewer/debug-log fetches. Added dep: `qrcode.react`.
+- **Guard rail:** default OFF so the currently-working TV keeps rendering until deliberately enabled and
+  paired; keep `AUTH_COOKIE_SECURE=false` on the plain-http LAN or the cookie won't be sent.
+
+**Verify:** `python -m py_compile` (config, media_utils, ambient_router, backfill_posters, auth, auth_router,
+database, displays_router) OK; `import server.main` OK; `npm run build` green. On-device: unchanged with
+`DISPLAY_AUTH_ENABLED` off; oversized/off-aspect image uploads warn; `--force-posters` yields `-poster.png`.

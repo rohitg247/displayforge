@@ -16,6 +16,9 @@ import { AmbientDisplaysPage } from "./pages/AmbientDisplaysPage";
 import { AmbientViewerPage } from "./pages/AmbientViewerPage";
 import AmbientOrientationGate from "./components/AmbientOrientationGate";
 import { AmbientDebugLogPage } from "./pages/AmbientDebugLogPage";
+import { ProtectedDisplayRoute } from "./routes/ProtectedDisplayRoute";
+import { PairApprovePage } from "./pages/PairApprovePage";
+import { DevicesPage } from "./pages/DevicesPage";
 import NotFound from "./pages/NotFound";
 
 const queryClient = new QueryClient();
@@ -30,13 +33,31 @@ const App = () => (
           <Routes>
             <Route path="/" element={<Navigate to="/admin/login" replace />} />
             <Route path="/admin/login" element={<LoginPage />} />
-            <Route path="/:branchId/1/:id" element={<DisplayViewerPage />} />
+            {/* Display-device pairing approval (admin-only, opened from a display's QR). */}
+            <Route
+              path="/pair/:code"
+              element={
+                <ProtectedRoute>
+                  <PairApprovePage />
+                </ProtectedRoute>
+              }
+            />
+            <Route
+              path="/:branchId/1/:id"
+              element={
+                <ProtectedDisplayRoute kind="interactive">
+                  <DisplayViewerPage />
+                </ProtectedDisplayRoute>
+              }
+            />
             <Route
               path="/:branchId/2/:id"
               element={
-                <AmbientOrientationGate>
-                  <AmbientViewerPage />
-                </AmbientOrientationGate>
+                <ProtectedDisplayRoute kind="ambient">
+                  <AmbientOrientationGate>
+                    <AmbientViewerPage />
+                  </AmbientOrientationGate>
+                </ProtectedDisplayRoute>
               }
             />
             <Route path="/:branchId/2/:id/debug-log/latest" element={<AmbientDebugLogPage />} />
@@ -52,6 +73,7 @@ const App = () => (
               <Route path="branches" element={<BranchesPage />} />
               <Route path="displays" element={<DisplaysPage />} />
               <Route path="ambient" element={<AmbientDisplaysPage />} />
+              <Route path="devices" element={<DevicesPage />} />
               <Route path="displays/:id/editor" element={<CaseStudyEditorPage />} />
             </Route>
             <Route path="*" element={<NotFound />} />

@@ -2,7 +2,7 @@ import sqlite3
 import json
 from fastapi import APIRouter, Depends, HTTPException, Query
 from ..database import db_dependency
-from ..auth import get_current_user
+from ..auth import get_current_user, get_display_viewer
 from ..models import DisplayCreate, DisplayUpdate, DisplayOut
 
 router = APIRouter()
@@ -47,9 +47,11 @@ def get_display(
     display_id: int,
     admin: bool = Query(default=False),
     db: sqlite3.Connection = Depends(db_dependency),
+    _viewer: None = Depends(get_display_viewer),
 ):
-    """Public endpoint — returns display with nested case studies.
-    Without ?admin=true only published case studies are returned."""
+    """Display-viewer endpoint — returns display with nested case studies. Public unless
+    DISPLAY_AUTH_ENABLED, in which case it requires an admin session or a paired device cookie
+    (get_display_viewer). Without ?admin=true only published case studies are returned."""
     try:
         disp = db.execute(
             "SELECT id, branch_id, name FROM displays WHERE id = ?", (display_id,)

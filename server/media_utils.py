@@ -345,6 +345,71 @@ def _within_ceiling(w, h):
     return max(w, h) <= _MAX_LONG_SIDE and min(w, h) <= _MAX_SHORT_SIDE
 
 
+# ----------------------------------------------------------------------------------------------
+# Image-safety contract (uploads). Mirrors the video pipeline's "least processing that preserves
+# quality" rule: an image is left byte-for-byte unless it EXCEEDS the FullHD ceiling, in which case it
+# is downscaled ONCE (Lanczos, aspect preserved, never upscaled/cropped). Aspect vs the display target
+# is only WARNED about (or rejected under AMBIENT_IMAGE_STRICT) — never silently altered.
+# ----------------------------------------------------------------------------------------------
+
+def probe_image(path, timeout: int = 15):
+    """Return {w, h} for an image file (ffprobe reads it as a single-frame stream), or None on failure."""
+    if not _ffprobe_available():
+        return None
+    cmd = ["ffprobe", "-v", "error", "-select_streams", "v:0",
+           "-show_entries", "stream=width,height", "-of", "csv=p=0", str(path)]
+    proc = _run(cmd, timeout)
+    if proc is None or proc.returncode != 0 or not proc.stdout:
+        return None
+    parts = proc.stdout.decode("utf-8", "ignore").strip().split(",")
+    try:
+        return {"w": int(parts[0]), "h": int(parts[1])}
+    except (ValueError, IndexError):
+        return None
+
+
+def normalize_image(src_path, dst_path, timeout: int = 60) -> str:
+    """Downscale an OVERSIZED upload image to the Tizen FullHD ceiling once (high quality), else skip.
+
+    3-state, mirroring ``normalize_video``:
+      - ``'skip'``    — already within 1920x1080 (either orientation): nothing written; serve the ORIGINAL.
+      - ``'written'`` — a downscaled ``dst_path`` was produced (aspect preserved, Lanczos, never upscaled).
+      - ``'failed'``  — ffmpeg missing / probe or encode error: caller keeps the original.
+
+    Never upscales, never crops, never raises. PNG stays lossless; JPEG/WebP use a near-lossless -q:v 2.
+    """
+    src_path = Path(src_path)
+    dst_path = Path(dst_path)
+    if not src_path.exists() or not ffmpeg_available():
+        return "failed"
+    meta = probe_image(src_path)
+    if not meta:
+        return "failed"
+    vf = _downscale_filter(meta["w"], meta["h"])
+    if not vf:
+        return "skip"                       # within the ceiling — no resample needed
+    vf = vf + ":flags=lanczos"
+    fmt_args = [] if dst_path.suffix.lower() == ".png" else ["-q:v", "2"]
+    cmd = ["ffmpeg", "-y", "-i", str(src_path), "-vf", vf, "-frames:v", "1"] + fmt_args + [str(dst_path)]
+    if _run_ok(cmd, dst_path, timeout):
+        return "written"
+    return "failed"
+
+
+def image_aspect_warning(w, h, orientation, tolerance):
+    """Return a human-readable warning if (w,h) deviates from the display's target aspect
+    (16:9 landscape / 9:16 portrait) by more than `tolerance` (fraction of the target), else None."""
+    if not w or not h:
+        return None
+    target_w, target_h = _orientation_box(orientation)   # 1920x1080 or 1080x1920
+    target = target_w / target_h
+    actual = w / h
+    if abs(actual - target) / target > tolerance:
+        return (f"image aspect {w}x{h} (~{actual:.2f}:1) differs from the {orientation} target "
+                f"{target_w}x{target_h} (~{target:.2f}:1); it will be cropped (object-fit: cover)")
+    return None
+
+
 def _pick_target_spec(video_metas, orientation):
     """Pick the concat target (w, h, fps): the most common geometry among in-spec H.264/yuv420p
     videos (so the MOST clips can be stream-copied losslessly), else the orientation box @30."""

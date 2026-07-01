@@ -114,8 +114,10 @@ export function AmbientDisplaysPage() {
     const files = Array.from(e.target.files);
     if (!files.length || !expandedId) return;
     try {
-      await api.uploadAmbientMedia(expandedId, files, activeTab);
+      const res = await api.uploadAmbientMedia(expandedId, files, activeTab);
       toast.success('Media uploaded');
+      // Image-safety warnings (oversized-downscaled / off-aspect) surfaced per file, non-blocking.
+      (res?.warnings || []).forEach((w) => toast.warning(w, { duration: 8000 }));
       await fetchMedia(expandedId, activeTab);
       fetchDisplays();
     } catch (err) { toast.error(err.message); }

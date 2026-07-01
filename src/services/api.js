@@ -55,6 +55,33 @@ export const api = {
   logout: () =>
     request('/api/auth/logout', { method: 'POST' }).catch(() => {}),
 
+  // Display-device auth (Part D): one-time pairing (QR) + password fallback + admin device mgmt.
+  // deviceLogin uses raw fetch (NOT `request`) so a bad password shows an inline error instead of
+  // bouncing the display to /admin/login.
+  deviceLogin: (email, password, ident = {}) =>
+    fetch(`${API_BASE}/api/auth/device-login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify({ email, password, ...ident }),
+    }).then(async (r) => {
+      if (!r.ok) { const b = await r.json().catch(() => ({})); throw new Error(b.detail || 'Login failed'); }
+      return r.json();
+    }),
+  pairStart: (ident = {}) =>
+    fetch(`${API_BASE}/api/auth/pair/start`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      credentials: 'include',
+      body: JSON.stringify(ident),
+    }).then((r) => r.json()),
+  pairPoll: (code) =>
+    fetch(`${API_BASE}/api/auth/pair/${code}`, { credentials: 'include' }).then((r) => r.json()),
+  pairApprove: (code) =>
+    request('/api/auth/pair/approve', { method: 'POST', body: JSON.stringify({ code }) }),
+  listDevices: () => request('/api/auth/devices'),
+  revokeDevice: (id) => request(`/api/auth/devices/${id}/revoke`, { method: 'POST' }),
+
   // Tree (full nested data)
   getBranchesTree: () => request('/api/branches/tree'),
 
@@ -72,7 +99,10 @@ export const api = {
     request(`/api/displays${branchId ? `?branch_id=${branchId}` : ''}`),
   getDisplay: (id, admin = false) => {
     const params = admin ? '?admin=true' : '';
-    return fetch(`${API_BASE}/api/displays/${id}${params}`).then((r) => {
+    // credentials:'include' sends the device cookie when DISPLAY_AUTH_ENABLED; a 401 means the display
+    // isn't paired → ProtectedDisplayRoute shows the display login (it does NOT redirect to /admin/login).
+    return fetch(`${API_BASE}/api/displays/${id}${params}`, { credentials: 'include' }).then((r) => {
+      if (r.status === 401) { const e = new Error('unauthorized'); e.status = 401; throw e; }
       if (!r.ok) throw new Error('Failed to fetch display');
       return r.json();
     });
@@ -124,7 +154,8 @@ export const api = {
     const params = new URLSearchParams();
     if (playlist) params.append('playlist', playlist);
     if (admin) params.append('admin', 'true');
-    return fetch(`${API_BASE}/api/ambient/${id}?${params}`).then((r) => {
+    return fetch(`${API_BASE}/api/ambient/${id}?${params}`, { credentials: 'include' }).then((r) => {
+      if (r.status === 401) { const e = new Error('unauthorized'); e.status = 401; throw e; }
       if (!r.ok) throw new Error('Failed to fetch ambient display');
       return r.json();
     });
@@ -179,7 +210,7 @@ export const api = {
   // API_BASE as every other call, so the host/port stays env-driven (VITE_API_URL), never hardcoded.
   getAmbientDebugLog: (id, date) => {
     const qs = date ? `?date=${encodeURIComponent(date)}` : '';
-    return fetch(`${API_BASE}/api/ambient/${id}/debug-log/latest${qs}`).then((r) => {
+    return fetch(`${API_BASE}/api/ambient/${id}/debug-log/latest${qs}`, { credentials: 'include' }).then((r) => {
       if (!r.ok) throw new Error(`HTTP ${r.status}`);
       return r.text();
     });

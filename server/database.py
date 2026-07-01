@@ -32,6 +32,23 @@ def init_db():
     schema_path = Path(__file__).parent / "schema.sql"
     conn.executescript(schema_path.read_text())
 
+    # Display-URL device auth (Part D): one row per authorized display device. `jti` is the device
+    # JWT's id; revocation is enforced server-side by looking `jti` up here on every viewer request.
+    # Already scoped per branch + display; a future client_id/tenant_id column extends it to multi-tenant.
+    conn.execute(
+        """CREATE TABLE IF NOT EXISTS display_devices (
+               id           INTEGER PRIMARY KEY AUTOINCREMENT,
+               jti          TEXT NOT NULL UNIQUE,
+               branch_id    INTEGER,
+               display_type INTEGER,
+               display_id   INTEGER,
+               label        TEXT,
+               created_at   TEXT NOT NULL DEFAULT (datetime('now')),
+               last_seen_at TEXT,
+               revoked      INTEGER NOT NULL DEFAULT 0
+           )"""
+    )
+
     # Idempotent column adds for existing production databases (schema.sql's CREATE TABLE
     # IF NOT EXISTS never alters an existing table). Safe to run on every startup.
     for stmt in (

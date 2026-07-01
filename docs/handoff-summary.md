@@ -5,7 +5,18 @@
 **Status:** **STABLE baseline `3.1-loop-hardened`** (engine == known-good `52f81c2` + larger
 announcement bar). Browser-grade; see the two-phase plan below.
 
-> **CURRENT — Update 2026-06-27 (engine `3.1-loop-hardened`) — prefetch congestion fix:**
+> **CURRENT — Update 2026-07-01 — image-safety contract + poster sharpen + display-URL device auth:**
+> Three shipped changes (no viewer-engine change): (1) `backfill_posters.py --force-posters` regenerates
+> legacy `.jpg` "soft" posters as lossless `.png` (DB-first); (2) an image-safety contract at upload
+> (`media_utils.normalize_image`/`probe_image`/`image_aspect_warning` → auto-downscale oversized, warn or
+> `AMBIENT_IMAGE_STRICT`-reject off-aspect); (3) a one-time, revocable **device auth** for the public
+> display URLs behind `DISPLAY_AUTH_ENABLED` (default OFF) — QR pairing + password fallback,
+> `display_devices` table, `auth.get_display_viewer` gate with per-request `jti` revocation, admin Devices
+> page. Dark-frame diagnosis is LOCKED: the dimming is Samsung panel behaviour (AVPlay-only fix); a
+> distinct loop-restart true-black is tracked (bisect pre-`9b001c7` on-panel). Full detail: `changes.md`
+> (2026-07-01) + `docs/media-pipeline-map.md`.
+>
+> **Update 2026-06-27 (engine `3.1-loop-hardened`) — prefetch congestion fix:**
 > On-panel logs (display 2, 06-26) exposed a **new, network-driven** failure: a video took **~44 s** to
 > reach `loadedmetadata` and tripped the 4000 ms `swap-timeout` (a ~40 s black stall). Cause was **not**
 > a transition bug — `startPrefetch` fired **unbounded** concurrent `fetch()`es (one per ~5 s swap) that,

@@ -29,15 +29,24 @@ from .config import settings
 from .media_utils import extract_last_frame, extract_first_frame, normalize_video, ffmpeg_available
 
 
-def _backfill_posters(conn, upload_dir) -> None:
-    """Ensure every video row has a poster. Safe, additive, idempotent."""
+def _backfill_posters(conn, upload_dir, force=False) -> None:
+    """Ensure every video row has a poster. Safe, additive, idempotent.
+
+    Default: only fill rows MISSING a poster (rows with any poster_path are left alone).
+    ``force=True`` (--force-posters): also REGENERATE rows whose poster is a legacy ``.jpg`` "soft
+    poster" as a lossless ``.png`` (rows already on ``.png`` are left untouched). Ordering is DB-first —
+    the new ``.png`` is written, the row is repointed, and only THEN is the superseded ``.jpg`` deleted —
+    so a row is never left without a poster on disk (which would fall back to the Tizen canvas-bridge)."""
     rows = conn.execute(
         "SELECT id, file_path, poster_path FROM ambient_media WHERE media_type = 'video'"
     ).fetchall()
 
     generated = linked = skipped = failed = 0
     for r in rows:
-        if r["poster_path"]:
+        existing = r["poster_path"]
+        is_png = bool(existing) and existing.lower().endswith(".png")
+        # Skip when a poster is already set AND either we're not forcing, or it's already a .png.
+        if existing and (not force or is_png):
             skipped += 1
             continue
 
@@ -45,27 +54,39 @@ def _backfill_posters(conn, upload_dir) -> None:
         poster_name = f"{video_disk.stem}-poster.png"  # lossless cover (matches upload path)
         poster_disk = upload_dir / poster_name
         poster_url = f"/uploads/{poster_name}"
+        old_poster_name = Path(existing).name if existing else None
 
-        # Reuse an existing poster file if present (e.g. a prior partial run).
-        if poster_disk.exists() and poster_disk.stat().st_size > 0:
+        def _repoint_and_prune():
+            # DB-first: repoint to the new .png (already on disk), then drop the superseded old poster.
             conn.execute("UPDATE ambient_media SET poster_path = ? WHERE id = ?", (poster_url, r["id"]))
             conn.commit()
+            if old_poster_name and old_poster_name != poster_name:
+                old = upload_dir / old_poster_name
+                if old.exists():
+                    try:
+                        old.unlink()
+                    except OSError:
+                        pass
+
+        # Reuse an existing .png poster file if present (prior partial run, or already-regenerated).
+        if poster_disk.exists() and poster_disk.stat().st_size > 0:
+            _repoint_and_prune()
             linked += 1
             print(f"linked existing poster  media {r['id']:>4} -> {poster_url}")
             continue
 
         if extract_last_frame(video_disk, poster_disk):
-            conn.execute("UPDATE ambient_media SET poster_path = ? WHERE id = ?", (poster_url, r["id"]))
-            conn.commit()
+            _repoint_and_prune()
             generated += 1
-            print(f"generated poster        media {r['id']:>4} -> {poster_url}")
+            tag = "regenerated (.jpg->.png)" if existing else "generated"
+            print(f"{tag:<24} media {r['id']:>4} -> {poster_url}")
         else:
             failed += 1
             print(f"FAILED (missing file/decode)  media {r['id']:>4} ({r['file_path']})")
 
     print(
         f"Posters: generated={generated} linked={linked} "
-        f"skipped(already set)={skipped} failed={failed}"
+        f"skipped(kept)={skipped} failed={failed}"
     )
 
 
@@ -212,6 +233,13 @@ def main() -> None:
         help="Also generate first-frame thumbnails for existing videos (admin media list). "
              "Safe/idempotent. Default: off.",
     )
+    parser.add_argument(
+        "--force-posters",
+        action="store_true",
+        help="Regenerate legacy .jpg 'soft' posters as lossless .png (DB-first; deletes the old .jpg "
+             "only after the new .png + DB pointer are in place). Rows already on .png are untouched. "
+             "Default: off.",
+    )
     args = parser.parse_args()
 
     if not ffmpeg_available():
@@ -226,7 +254,7 @@ def main() -> None:
     # is a no-op for those rows (poster_path already set) and only catches anything left over.
     if args.normalize:
         _normalize_existing(conn, upload_dir)
-    _backfill_posters(conn, upload_dir)
+    _backfill_posters(conn, upload_dir, force=args.force_posters)
     if args.thumbs:
         _backfill_thumbs(conn, upload_dir)
     if args.playlist_videos:
